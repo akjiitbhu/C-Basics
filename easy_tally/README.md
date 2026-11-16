@@ -12,6 +12,19 @@ python run.py                        # needs Python 3.9+ with Tkinter
 ```
 Linux: if `import tkinter` fails, install it (`sudo apt install python3-tk`).
 
+## Install on Windows (no Python needed)
+
+Download `EasyTally-Setup.exe` from the **Actions** tab of the GitHub repository (open the latest
+"Build Windows installer" run, then the `EasyTally-Setup` artifact), or from a Release if you attach it.
+Double-click, press Next, and EasyTally appears in the Start menu and on the desktop. It runs fully
+offline on that one machine. All customer data is in `%USERPROFILE%\EasyTally` and is kept when the
+app is uninstalled. To back up or move to another PC, copy that folder.
+
+Windows may show a "SmartScreen" warning because the installer is not code-signed; choose
+*More info -> Run anyway*. (A code-signing certificate removes this.)
+
+To build it yourself on Windows: run `build_windows.bat` in this folder.
+
 ## Features
 
 | Area | What it does |
