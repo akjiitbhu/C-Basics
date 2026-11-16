@@ -25,7 +25,7 @@ jobs:
       - name: Build EasyTally.exe
         run: >
           python -m PyInstaller --noconfirm --clean --windowed --name EasyTally
-          --collect-all pdfplumber --collect-all pdfminer --collect-all pypdfium2 run.py
+          --collect-all pdfplumber --collect-all pdfminer --collect-all pypdfium2 --add-data "easytally/web/static;easytally/web/static" run.py
       - name: Smoke-test the built exe can import its parser
         shell: bash
         run: |

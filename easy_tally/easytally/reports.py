@@ -232,3 +232,28 @@ def export_csv(report: Report, path):
         w.writerow([report.title])
         w.writerow(report.columns)
         w.writerows(report.rows)
+
+
+REPORT_NAMES = ["Day Book", "Ledger Statement", "Trial Balance", "Profit & Loss", "Balance Sheet",
+                "GST Summary", "Stock Summary"]
+
+
+def run_report(b: Books, name: str, start: str, end: str, ledger_id=None) -> Report:
+    """Run a report by display name. `start`/`end` are ISO dates (end doubles as 'as on')."""
+    if name == "Day Book":
+        return day_book(b, start, end)
+    if name == "Ledger Statement":
+        if not ledger_id:
+            raise ValueError("Choose a ledger for the Ledger Statement.")
+        return ledger_statement(b, int(ledger_id), start, end)
+    if name == "Trial Balance":
+        return trial_balance(b, end)
+    if name == "Profit & Loss":
+        return profit_and_loss(b, start, end)
+    if name == "Balance Sheet":
+        return balance_sheet(b, end)
+    if name == "GST Summary":
+        return gst_summary(b, start, end)
+    if name == "Stock Summary":
+        return stock_summary(b, end)
+    raise ValueError(f"Unknown report: {name}")

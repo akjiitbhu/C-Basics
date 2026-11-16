@@ -23,13 +23,16 @@ UninstallDisplayName={#AppName}
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; Flags: checkedonce
+Name: "webicon"; Description: "Create a desktop shortcut for the &browser version"; Flags: unchecked
 
 [Files]
 Source: "..\dist\EasyTally\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\EasyTally.exe"
+Name: "{group}\{#AppName} (Browser)"; Filename: "{app}\EasyTally.exe"; Parameters: "--web"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\EasyTally.exe"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName} (Browser)"; Filename: "{app}\EasyTally.exe"; Parameters: "--web"; Tasks: webicon
 
 [Run]
 Filename: "{app}\EasyTally.exe"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent

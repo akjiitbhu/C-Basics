@@ -479,8 +479,7 @@ class BankTab(BaseTab):
 
 
 # ------------------------------------------------------------------------------ Reports
-REPORT_NAMES = ["Day Book", "Ledger Statement", "Trial Balance", "Profit & Loss", "Balance Sheet",
-                "GST Summary", "Stock Summary"]
+REPORT_NAMES = reports.REPORT_NAMES
 
 
 class ReportsTab(BaseTab):
@@ -516,24 +515,8 @@ class ReportsTab(BaseTab):
         b = self.books
         try:
             start, end = parse_date(self.start.get()), parse_date(self.end.get())
-            n = self.name.get()
-            if n == "Day Book":
-                rep = reports.day_book(b, start, end)
-            elif n == "Ledger Statement":
-                lid = self.ledger_map().get(self.ledger.get())
-                if not lid:
-                    raise ValueError("Choose a ledger for the Ledger Statement.")
-                rep = reports.ledger_statement(b, lid, start, end)
-            elif n == "Trial Balance":
-                rep = reports.trial_balance(b, end)
-            elif n == "Profit & Loss":
-                rep = reports.profit_and_loss(b, start, end)
-            elif n == "Balance Sheet":
-                rep = reports.balance_sheet(b, end)
-            elif n == "GST Summary":
-                rep = reports.gst_summary(b, start, end)
-            else:
-                rep = reports.stock_summary(b, end)
+            lid = self.ledger_map().get(self.ledger.get())
+            rep = reports.run_report(b, self.name.get(), start, end, lid)
         except ValueError as e:
             if not quiet:
                 _error(e)

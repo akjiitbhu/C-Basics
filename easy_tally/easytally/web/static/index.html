@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EasyTally</title>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--ink:#1d2433;--muted:#6b7385;--line:#dfe3ea;--brand:#1f6feb;--brand-ink:#fff;--warn:#fff3cd;--bad:#c62828;--good:#1b7f3b}
+@media (prefers-color-scheme:dark){:root{--bg:#12151c;--card:#1b2029;--ink:#e6e9ef;--muted:#98a1b3;--line:#2c3340;--brand:#4c8dff;--brand-ink:#fff;--warn:#4a3f12;--bad:#ff6b6b;--good:#4cc27a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:10px 20px;background:var(--card);border-bottom:1px solid var(--line)}
+header h1{font-size:17px;margin:0}header .co{color:var(--muted)}header .sp{flex:1}
+nav{display:flex;gap:4px;padding:8px 20px 0;background:var(--card);border-bottom:1px solid var(--line);flex-wrap:wrap}
+nav button{border:0;background:none;color:var(--muted);padding:9px 14px;cursor:pointer;border-bottom:3px solid transparent;font:inherit}
+nav button.on{color:var(--brand);border-color:var(--brand);font-weight:600}
+main{padding:16px 20px;max-width:1300px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
+.card h3{margin:0 0 10px;font-size:15px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;align-items:end}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:14px}
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:3px}
+input,select{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--ink);font:inherit}
+a.b,button.b{display:inline-block;padding:7px 14px;border:1px solid var(--line);border-radius:7px;background:var(--card);color:var(--ink);cursor:pointer;font:inherit}
+button.p,a.p{background:var(--brand);color:var(--brand-ink);border-color:var(--brand)}
+button.d{color:var(--bad)}button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.tw{overflow:auto;max-height:420px;border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%}
+th,td{padding:6px 9px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{position:sticky;top:0;background:var(--card);font-size:12px;color:var(--muted)}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+tr.muted td{color:var(--muted)}tr.warn td{background:var(--warn)}tr.bold td{font-weight:700}
+.msg{padding:8px 10px;border-radius:7px;margin-top:8px}
+#toast{position:fixed;right:18px;bottom:18px;max-width:440px;padding:11px 15px;border-radius:9px;color:#fff;background:var(--good);display:none;white-space:pre-wrap;z-index:9}
+#toast.bad{background:var(--bad)}
+.picker{max-width:560px;margin:50px auto}.picker li{list-style:none}
+.co-btn{display:block;width:100%;text-align:left;margin:6px 0;padding:11px 14px}
+.muted{color:var(--muted)}.tot{font-weight:600}
+.drop{border:2px dashed var(--line);border-radius:10px;padding:18px;text-align:center;color:var(--muted)}
+.drop.over{border-color:var(--brand);background:var(--bg)}
+</style>
+</head>
+<body>
+<header><h1>EasyTally</h1><span class="co" id="co"></span><span class="sp"></span>
+  <button class="b" id="switch" style="display:none" onclick="switchCompany()">Switch company</button>
+  <button class="b" onclick="quit()">Quit</button></header>
+<nav id="nav" style="display:none"></nav>
+<main id="main"></main>
+<div id="toast"></div>
+<script>
+"use strict";
+const $=(s,e=document)=>e.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const today=()=>new Date(Date.now()-new Date().getTimezoneOffset()*6e4).toISOString().slice(0,10);
+const fyStart=()=>{const d=new Date();const y=d.getMonth()>=3?d.getFullYear():d.getFullYear()-1;return y+"-04-01"};
+let META={}, TAB="masters";
+const TABS=[["masters","Masters"],["vouchers","Vouchers"],["invoices","Invoices (GST)"],["bank","Bank Statements"],["reports","Reports"]];
+
+async function api(path,body,raw){
+  const o={headers:{"X-EasyTally":"1"}};
+  if(raw!==undefined){o.method="POST";o.body=raw;o.headers["Content-Type"]="application/octet-stream"}
+  else if(body!==undefined){o.method="POST";o.headers["Content-Type"]="application/json";o.body=JSON.stringify(body)}
+  const r=await fetch(path,o);let j;try{j=await r.json()}catch{j={error:"Unexpected response"}}
+  if(!r.ok)throw new Error(j.error||r.statusText);return j;
+}
+let tt;function toast(m,bad){const t=$("#toast");t.textContent=m;t.className=bad?"bad":"";t.style.display="block";clearTimeout(tt);tt=setTimeout(()=>t.style.display="none",bad?7000:3500)}
+const guard=fn=>async(...a)=>{try{return await fn(...a)}catch(e){toast(e.message,true)}};
+const opts=(l,v,t,sel,blank)=>(blank?`<option value="">${esc(blank)}</option>`:"")+l.map(x=>`<option value="${esc(x[v])}"${String(x[v])===String(sel)?" selected":""}>${esc(x[t])}</option>`).join("");
+const sopts=(l,sel)=>l.map(x=>`<option${x===sel?" selected":""}>${esc(x)}</option>`).join("");
+const stateOpts=()=>`<option value="">(not set)</option>`+META.states.map(s=>`<option value="${s.code}">${s.code} - ${esc(s.name)}</option>`).join("");
+const table=(cols,rows,numCols=[])=>`<div class="tw"><table><thead><tr>${cols.map((c,i)=>`<th class="${numCols.includes(i)?"n":""}">${esc(c)}</th>`).join("")}</tr></thead><tbody>${rows.join("")||`<tr><td colspan="${cols.length}" class="muted">Nothing here yet.</td></tr>`}</tbody></table></div>`;
+
+/* ---------- start / company ---------- */
+async function start(){
+  META=await api("/api/meta");
+  $("#co").textContent=META.company?"— "+META.company:"";
+  $("#switch").style.display=META.company?"":"none";
+  $("#nav").style.display=META.company?"":"none";
+  if(!META.company)return picker();
+  $("#nav").innerHTML=TABS.map(([k,t])=>`<button class="${k===TAB?"on":""}" onclick="go('${k}')">${t}</button>`).join("");
+  await show();
+}
+async function picker(){
+  const cs=await api("/api/companies");
+  $("#main").innerHTML=`<div class="picker card"><h3>Select a customer company</h3>
+   ${cs.map(c=>`<button class="b co-btn" onclick="openCo('${esc(c.slug)}')">${esc(c.name)}</button>`).join("")||`<p class="muted">No companies yet. Create the first one below.</p>`}
+   <hr style="border:0;border-top:1px solid var(--line);margin:14px 0"><h3>New company</h3>
+   <div class="grid"><div><label>Company name</label><input id="cn"></div>
+   <div><label>State</label><select id="cs">${stateOpts()}</select></div>
+   <div><label>GSTIN (optional)</label><input id="cg"></div></div>
+   <div class="row"><button class="b p" onclick="newCo()">Create & open</button></div></div>`;
+}
+const openCo=guard(async s=>{await api("/api/company/open",{slug:s});await start()});
+const newCo=guard(async()=>{await api("/api/company/create",{name:$("#cn").value,state:$("#cs").value,gstin:$("#cg").value});await start()});
+const switchCompany=guard(async()=>{await api("/api/company/close",{});await start()});
+const quit=async()=>{if(!confirm("Quit EasyTally? Your data is saved."))return;try{await api("/api/shutdown",{})}catch{}document.body.innerHTML='<p style="padding:40px">EasyTally has stopped. You can close this tab. Start it again from the Start menu.</p>'};
+function go(t){TAB=t;start()}
+const show=guard(async()=>{await({masters,vouchers,invoices,bank,reports}[TAB])()});
+
+/* ---------- masters ---------- */
+async function masters(){
+  const [L,I]=await Promise.all([api("/api/ledgers"),api("/api/items")]);
+  $("#main").innerHTML=`<div class="two">
+  <div class="card"><h3>Ledgers</h3>
+   <div class="grid"><div><label>Name</label><input id="ln"></div>
+   <div><label>Under group</label><select id="lg">${sopts(META.groups,"Sundry Debtors")}</select></div>
+   <div><label>Opening balance</label><input id="lo" value="0" inputmode="decimal"></div>
+   <div><label>Dr / Cr</label><select id="ls"><option>Dr</option><option>Cr</option></select></div>
+   <div><label>GSTIN</label><input id="lt"></div><div><label>State (GST)</label><select id="lst">${stateOpts()}</select></div></div>
+   <div class="row"><button class="b p" onclick="addLedger()">Add ledger</button></div><br>
+   ${table(["Name","Group","Opening","GSTIN",""],L.map(l=>`<tr><td>${esc(l.name)}</td><td>${esc(l.group)}</td><td class="n">${esc(l.opening)}</td><td>${esc(l.gstin)}</td><td><button class="b d" onclick="delLedger(${l.id})">Delete</button></td></tr>`),[2])}</div>
+  <div class="card"><h3>Stock items</h3>
+   <div class="grid"><div><label>Item name</label><input id="in"></div><div><label>Unit</label><input id="iu" value="Nos"></div>
+   <div><label>HSN / SAC</label><input id="ih"></div><div><label>GST %</label><select id="ir">${sopts(META.gst_rates.map(String),"18")}</select></div>
+   <div><label>Opening qty</label><input id="iq" value="0"></div><div><label>Opening value</label><input id="iv" value="0"></div></div>
+   <div class="row"><button class="b p" onclick="addItem()">Add item</button></div><br>
+   ${table(["Item","Unit","HSN","GST %","Open qty","Open value",""],I.map(i=>`<tr><td>${esc(i.name)}</td><td>${esc(i.unit)}</td><td>${esc(i.hsn)}</td><td>${i.gst_rate}</td><td class="n">${i.opening_qty}</td><td class="n">${i.opening_value}</td><td><button class="b d" onclick="delItem(${i.id})">Delete</button></td></tr>`),[4,5])}</div></div>`;
+}
+const addLedger=guard(async()=>{await api("/api/ledgers",{name:$("#ln").value,group:$("#lg").value,opening:$("#lo").value,side:$("#ls").value,gstin:$("#lt").value,state:$("#lst").value});toast("Ledger added");masters()});
+const delLedger=guard(async id=>{await api("/api/ledgers/delete",{id});masters()});
+const addItem=guard(async()=>{await api("/api/items",{name:$("#in").value,unit:$("#iu").value,hsn:$("#ih").value,gst_rate:$("#ir").value,opening_qty:$("#iq").value,opening_value:$("#iv").value});toast("Item added");masters()});
+const delItem=guard(async id=>{await api("/api/items/delete",{id});masters()});
+
+/* ---------- vouchers ---------- */
+let VL=[], LEDG=[];
+const paise=s=>Math.round(parseFloat(String(s).replace(/,/g,""))*100)||0;
+const money=p=>(p/100).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+async function vouchers(){
+  const [V,L]=await Promise.all([api("/api/vouchers"),api("/api/ledgers")]);LEDG=L;
+  $("#main").innerHTML=`<div class="card"><h3>New voucher</h3>
+   <div class="grid"><div><label>Type</label><select id="vt">${sopts(META.vtypes,"Payment")}</select></div>
+   <div><label>Date</label><input type="date" id="vd" value="${today()}"></div>
+   <div style="grid-column:span 2"><label>Narration</label><input id="vn"></div><div><label>Ref / cheque no.</label><input id="vr"></div></div>
+   <div class="grid" style="margin-top:10px"><div style="grid-column:span 2"><label>Ledger</label><select id="vl">${opts(L,"id","name","","Select ledger…")}</select></div>
+   <div><label>Dr / Cr</label><select id="vs"><option>Dr</option><option>Cr</option></select></div>
+   <div><label>Amount</label><input id="va" inputmode="decimal"></div><div><button class="b" onclick="vAdd()">Add line</button></div></div>
+   <div id="vlines"></div>
+   <div class="row"><button class="b p" onclick="vSave()">Save voucher</button><button class="b" onclick="VL=[];vRender()">Clear</button><span id="vtot" class="tot"></span></div></div>
+  <div class="card"><h3>Recent vouchers</h3>${table(["Date","Type","No.","Particulars","Amount","Narration",""],V.map(v=>`<tr><td>${v.date}</td><td>${v.vtype}</td><td>${v.number}</td><td>${esc(v.particulars)}</td><td class="n">${v.amount}</td><td>${esc(v.narration)}</td><td><button class="b d" onclick="vDel(${v.id})">Delete</button></td></tr>`),[4])}</div>`;
+  vRender();
+}
+function vRender(){
+  const dr=VL.filter(l=>l.side==="Dr").reduce((a,l)=>a+paise(l.amount),0),cr=VL.filter(l=>l.side==="Cr").reduce((a,l)=>a+paise(l.amount),0);
+  $("#vlines").innerHTML=VL.length?table(["Ledger","Dr/Cr","Amount",""],VL.map((l,i)=>`<tr><td>${esc(l.name)}</td><td>${l.side}</td><td class="n">${money(paise(l.amount))}</td><td><button class="b d" onclick="VL.splice(${i},1);vRender()">Remove</button></td></tr>`),[2]):"";
+  $("#vtot").textContent=`Dr ${money(dr)}   Cr ${money(cr)}   ${dr===cr&&dr?"✓ balanced":"difference "+money(Math.abs(dr-cr))}`;
+}
+function vAdd(){
+  const id=$("#vl").value;if(!id)return toast("Choose a ledger",true);
+  if(paise($("#va").value)<=0)return toast("Enter an amount greater than zero",true);
+  VL.push({ledger_id:id,name:LEDG.find(l=>String(l.id)===id).name,side:$("#vs").value,amount:$("#va").value});
+  const dr=VL.filter(l=>l.side==="Dr").reduce((a,l)=>a+paise(l.amount),0),cr=VL.filter(l=>l.side==="Cr").reduce((a,l)=>a+paise(l.amount),0);
+  $("#vs").value=dr>cr?"Cr":"Dr";$("#va").value=dr!==cr?(Math.abs(dr-cr)/100).toFixed(2):"";$("#vl").value="";vRender();
+}
+const vSave=guard(async()=>{await api("/api/vouchers",{vtype:$("#vt").value,date:$("#vd").value,narration:$("#vn").value,ref:$("#vr").value,lines:VL});VL=[];toast("Voucher saved");vouchers()});
+const vDel=guard(async id=>{if(confirm("Delete this voucher?")){await api("/api/vouchers/delete",{ids:[id]});vouchers()}});
+
+/* ---------- invoices ---------- */
+let IL=[], ITEMS=[], PARTIES=[];
+async function invoices(){
+  const [R,L,I]=await Promise.all([api("/api/invoices"),api("/api/ledgers"),api("/api/items")]);
+  ITEMS=I;PARTIES=L.filter(l=>l.group==="Sundry Debtors"||l.group==="Sundry Creditors");
+  $("#main").innerHTML=`<div class="card"><h3>New GST invoice</h3>
+   <div class="grid"><div><label>Type</label><select id="ik" onchange="iPrev()"><option>Sales</option><option>Purchase</option></select></div>
+   <div><label>Date</label><input type="date" id="id" value="${today()}"></div>
+   <div style="grid-column:span 2"><label>Party (debtor / creditor)</label><select id="ip" onchange="iPrev()">${opts(PARTIES,"id","name","","Select party…")}</select></div>
+   <div><label>Invoice no.</label><input id="ir"></div></div>
+   <div class="grid" style="margin-top:10px"><div style="grid-column:span 2"><label>Item</label><select id="ii">${opts(I,"id","name","","Select item…")}</select></div>
+   <div><label>Qty</label><input id="iqq" value="1"></div><div><label>Rate</label><input id="irt" inputmode="decimal"></div><div><button class="b" onclick="iAdd()">Add item</button></div></div>
+   <div id="ilines"></div><div class="row"><button class="b p" onclick="iSave()">Save invoice</button><button class="b" onclick="IL=[];iPrev()">Clear</button><span id="itot" class="tot"></span></div></div>
+  <div class="card"><h3>Recent invoices</h3>${table(["Date","Type","No.","Party","Taxable","CGST","SGST","IGST","Total",""],R.map(r=>`<tr><td>${r.date}</td><td>${r.kind}</td><td>${r.number}</td><td>${esc(r.party)}</td><td class="n">${r.taxable}</td><td class="n">${r.cgst}</td><td class="n">${r.sgst}</td><td class="n">${r.igst}</td><td class="n">${r.total}</td><td><button class="b d" onclick="iDel(${r.id})">Delete</button></td></tr>`),[4,5,6,7,8])}</div>`;
+  iPrev();
+}
+function iAdd(){
+  if(!$("#ii").value)return toast("Choose an item",true);
+  if(!(parseFloat($("#iqq").value)>0))return toast("Enter a valid quantity",true);
+  IL.push({item_id:$("#ii").value,qty:$("#iqq").value,rate:$("#irt").value||"0"});$("#ii").value="";$("#iqq").value="1";$("#irt").value="";iPrev();
+}
+const iPrev=guard(async()=>{
+  const el=$("#ilines");if(!el)return;
+  if(!IL.length||!$("#ip").value){el.innerHTML="";$("#itot").textContent=IL.length?"Select a party to see GST":"";return}
+  const p=await api("/api/invoices/preview",{kind:$("#ik").value,party_id:$("#ip").value,lines:IL});
+  el.innerHTML=table(["Item","Qty","Rate","GST %","Taxable","CGST","SGST","IGST",""],p.lines.map((l,i)=>`<tr><td>${esc(ITEMS.find(x=>String(x.id)===String(l.item_id)).name)}</td><td class="n">${l.qty}</td><td class="n">${l.rate}</td><td>${l.gst_rate}</td><td class="n">${l.taxable}</td><td class="n">${l.cgst}</td><td class="n">${l.sgst}</td><td class="n">${l.igst}</td><td><button class="b d" onclick="IL.splice(${i},1);iPrev()">Remove</button></td></tr>`),[1,2,4,5,6,7]);
+  $("#itot").textContent=`Taxable ${p.taxable}  CGST ${p.cgst}  SGST ${p.sgst}  IGST ${p.igst}  TOTAL ${p.total}  (${p.intra_state?"intra-state":"inter-state"})`;
+});
+const iSave=guard(async()=>{await api("/api/invoices",{kind:$("#ik").value,date:$("#id").value,party_id:$("#ip").value,ref:$("#ir").value,lines:IL});IL=[];toast("Invoice saved");invoices()});
+const iDel=guard(async id=>{if(confirm("Delete this invoice?")){await api("/api/vouchers/delete",{ids:[id]});invoices()}});
+
+/* ---------- bank statements ---------- */
+let BANK="", ALL=[];
+async function bank(){
+  const [B,L]=await Promise.all([api("/api/bank/accounts"),api("/api/ledgers")]);ALL=L;
+  if(!B.find(b=>String(b.id)===String(BANK)))BANK=B[0]?B[0].id:"";
+  $("#main").innerHTML=`<div class="card"><h3>Bank statements</h3>
+   <div class="grid"><div><label>Bank account</label><select id="bk" onchange="BANK=this.value;bankRows()">${opts(B,"id","name",BANK)}</select></div>
+   <div><label>New bank account name</label><input id="bn" placeholder="e.g. HDFC Current A/c"></div>
+   <div><label>Opening balance</label><input id="bo" value="0"></div>
+   <div><label>Dr / Cr</label><select id="bs"><option>Dr</option><option>Cr</option></select></div>
+   <div><button class="b" onclick="newBank()">Add bank account</button></div></div>
+   <div class="drop" id="drop" style="margin-top:12px">Drop statement PDF(s) here, or <label style="display:inline;color:var(--brand);cursor:pointer;font-size:inherit">choose files<input type="file" id="bf" accept="application/pdf" multiple hidden></label>
+   <div class="muted">Text-based PDFs downloaded from net banking. Re-importing the same statement is safe.</div></div><div id="bres"></div></div>
+   <div class="card"><div class="row" style="margin:0 0 8px"><h3 style="margin:0">Transactions</h3><span class="sp" style="flex:1"></span>
+    <label style="display:inline;margin:0"><input type="checkbox" id="bp" onchange="bankRows()" style="width:auto"> show posted</label>
+    <label style="display:inline;margin:0" title="When you pick a ledger, also remember it for similar narrations"><input type="checkbox" id="bl" style="width:auto"> remember choice</label></div>
+   <div id="brows"></div>
+   <div class="row"><button class="b p" onclick="bankPost('sel')">Post selected</button><button class="b" onclick="bankPost('mapped')">Post all with ledger</button>
+    <button class="b" onclick="bankPost('susp')">Post all (rest to Suspense)</button><span id="bsum" class="muted"></span></div></div>`;
+  const drop=$("#drop"),f=$("#bf");
+  f.onchange=()=>{const fs=[...f.files];f.value="";upload(fs)};   // reset so the same file can be chosen again
+  drop.ondragover=e=>{e.preventDefault();drop.classList.add("over")};drop.ondragleave=()=>drop.classList.remove("over");
+  drop.ondrop=e=>{e.preventDefault();drop.classList.remove("over");upload(e.dataTransfer.files)};
+  bankRows();
+}
+const newBank=guard(async()=>{await api("/api/ledgers",{name:$("#bn").value,group:"Bank Accounts",opening:$("#bo").value,side:$("#bs").value});toast("Bank account added");bank()});
+const upload=guard(async files=>{
+  if(!BANK)return toast("Add a bank account first",true);
+  const out=[];
+  for(const f of files){try{
+    const r=await api(`/api/bank/import?bank_id=${BANK}&filename=${encodeURIComponent(f.name)}`,undefined,await f.arrayBuffer());
+    out.push(`<div class="msg" style="background:var(--bg)"><b>${esc(f.name)}</b>: ${r.new} new, ${r.duplicates} already imported.${r.warnings.map(w=>`<div style="color:var(--bad)">⚠ ${esc(w)}</div>`).join("")}</div>`);
+  }catch(e){out.push(`<div class="msg" style="background:var(--warn)"><b>${esc(f.name)}</b>: ${esc(e.message)}</div>`)}}
+  $("#bres").innerHTML=out.join("");bankRows();
+});
+const bankRows=guard(async()=>{
+  if(!BANK){$("#brows").innerHTML='<p class="muted">Add a bank account to begin.</p>';return}
+  const T=await api(`/api/bank/txns?bank_id=${BANK}&posted=${$("#bp").checked?1:0}`);
+  $("#brows").innerHTML=table(["","Date","Narration","Debit","Credit","Ledger","Status"],T.map(t=>`<tr class="${t.posted?"muted":t.uncertain?"warn":""}"><td>${t.posted?"":`<input type="checkbox" class="bsel" value="${t.id}">`}</td><td>${t.date}</td><td>${esc(t.narration)}</td><td class="n">${t.debit}</td><td class="n">${t.credit}</td>
+   <td>${t.posted?esc((ALL.find(l=>l.id===t.ledger_id)||{}).name||""):`<select onchange="setLedger(${t.id},this.value,'${esc(t.narration).replace(/'/g,"\\'")}')">${opts(ALL,"id","name",t.ledger_id,"— choose —")}</select>`}</td>
+   <td>${t.posted?"Posted":t.uncertain?"Check Dr/Cr":"Pending"}</td></tr>`),[3,4]);
+  const pend=T.filter(t=>!t.posted);$("#bsum").textContent=`${pend.length} pending, ${pend.filter(t=>!t.ledger_id).length} without ledger`;
+});
+const setLedger=guard(async(id,lid,narr)=>{
+  let learn="";if($("#bl").checked&&lid){learn=prompt("Remember this keyword for future imports:",narr.split(/\s+/).slice(0,2).join(" "))||""}
+  await api("/api/bank/set_ledger",{ids:[id],ledger_id:lid||null,learn});bankRows();
+});
+const bankPost=guard(async mode=>{
+  let body={};
+  if(mode==="sel"){body.ids=[...document.querySelectorAll(".bsel:checked")].map(x=>x.value);if(!body.ids.length)return toast("Tick the rows to post",true)}
+  else{body.all_for_bank=BANK;if(mode==="susp"){if(!confirm("Rows without a ledger will be booked to 'Suspense A/c'. Continue?"))return;body.suspense=true}}
+  const r=await api("/api/bank/post",body);toast(`Posted ${r.posted} voucher(s). Skipped ${r.skipped} (no ledger or already posted).`);bank();
+});
+
+/* ---------- reports ---------- */
+let RQ={name:"Day Book",start:fyStart(),end:today(),ledger:""}, RL=[];
+async function reports(){
+  RL=await api("/api/ledgers");
+  $("#main").innerHTML=`<div class="card"><div class="grid"><div><label>Report</label><select id="rn">${sopts(META.reports,RQ.name)}</select></div>
+   <div><label>From</label><input type="date" id="rs" value="${RQ.start}"></div><div><label>To / as on</label><input type="date" id="re" value="${RQ.end}"></div>
+   <div><label>Ledger (for Ledger Statement)</label><select id="rl">${opts(RL,"id","name",RQ.ledger,"—")}</select></div>
+   <div class="row" style="margin:0"><button class="b p" onclick="runReport()">Run</button><a class="b" id="csv" style="text-decoration:none;color:inherit" href="#">Export CSV</a></div></div></div><div id="rout"></div>`;
+  runReport();
+}
+const runReport=guard(async()=>{
+  RQ={name:$("#rn").value,start:$("#rs").value,end:$("#re").value,ledger:$("#rl").value};
+  const qs=new URLSearchParams({name:RQ.name,start:RQ.start,end:RQ.end,ledger_id:RQ.ledger}).toString();
+  $("#csv").href="/api/report.csv?"+qs;
+  const r=await api("/api/report?"+qs);
+  const num=r.columns.map((c,i)=>/^(Debit|Credit|Amount|Balance|Taxable|CGST|SGST|IGST|Value|Avg Cost|Closing Qty|Inward|Outward)$/.test(c)?i:-1).filter(i=>i>=0);
+  $("#rout").innerHTML=`<div class="card"><h3>${esc(r.title)}</h3>${table(r.columns,r.rows.map(x=>`<tr class="${/^(TOTAL|NET|Total|Closing Balance|[A-Z &]+$)/.test(x[0])&&x[0]?"bold":""}">${x.map((c,i)=>`<td class="${num.includes(i)?"n":""}">${esc(c)}</td>`).join("")}</tr>`),num)}</div>`;
+});
+
+start().catch(e=>toast(e.message,true));
+</script>
+</body>
+</html>

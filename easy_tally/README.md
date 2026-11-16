@@ -12,6 +12,16 @@ python run.py                        # needs Python 3.9+ with Tkinter
 ```
 Linux: if `import tkinter` fails, install it (`sudo apt install python3-tk`).
 
+## Two ways to use it (same data, same features)
+
+- **Desktop window:** `EasyTally` shortcut (or `python run.py`).
+- **In your browser, offline:** `EasyTally (Browser)` shortcut (or `python run.py --web`). It starts a
+  small server on `127.0.0.1:8765` (this PC only, nothing is sent over the internet, no internet needed)
+  and opens your browser. Use the **Quit** button to stop it. Needs no Tkinter, so it also works on
+  Mac/Linux with just Python.
+
+Both versions read the same company files, so you can switch between them.
+
 ## Install on Windows (no Python needed)
 
 Download `EasyTally-Setup.exe` from the **Actions** tab of the GitHub repository (open the latest
@@ -72,7 +82,8 @@ sample to `tests/` and extend `_locate_columns` or the text parser.
 pip install reportlab       # only to generate sample PDFs for tests
 python -m unittest discover -s tests -t .
 ```
-The UI test uses a stub `tkinter`, so it checks wiring and logic, not appearance.
+The web tests start a real local server and check the JSON API and its security rules
+(foreign hosts/origins are refused). The desktop UI test uses a stub `tkinter`, so it checks wiring and logic, not appearance.
 
 ## Layout
 
@@ -83,5 +94,6 @@ easytally/
   bank_import.py  PDF statement parser and consistency checks
   gst.py          GST rates, state codes, CGST/SGST/IGST maths
   reports.py      all reports + CSV export
-  ui/             Tkinter screens (thin layer over the modules above)
+  ui/             Tkinter desktop screens (thin layer over the modules above)
+  web/            offline browser version: api.py (JSON API), server.py (localhost server), static/index.html
 ```
