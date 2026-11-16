@@ -26,11 +26,24 @@ jobs:
         run: >
           python -m PyInstaller --noconfirm --clean --windowed --name EasyTally
           --collect-all pdfplumber --collect-all pdfminer --collect-all pypdfium2 --add-data "easytally/web/static;easytally/web/static" run.py
-      - name: Smoke-test the built exe can import its parser
-        shell: bash
+      - name: Smoke-test the built exe in browser mode
+        shell: pwsh
         run: |
-          ls dist/EasyTally/EasyTally.exe
-          ls dist/EasyTally/_internal | head
+          $p = Start-Process dist\EasyTally\EasyTally.exe -ArgumentList "--web" -PassThru
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 1
+            try { $r = Invoke-RestMethod http://127.0.0.1:8765/api/ping; if ($r.app -eq "EasyTally") { $ok = $true; break } } catch {}
+          }
+          if (-not $ok) { throw "EasyTally --web did not start" }
+          $page = (Invoke-WebRequest http://127.0.0.1:8765/ -UseBasicParsing).Content
+          if ($page -notmatch "EasyTally") { throw "UI page missing from bundle" }
+          $h = @{ "X-EasyTally" = "1" }
+          Invoke-RestMethod http://127.0.0.1:8765/api/company/create -Method Post -Headers $h -ContentType "application/json" -Body '{"name":"CI Smoke Co","state":"27"}' | Out-Null
+          $m = Invoke-RestMethod http://127.0.0.1:8765/api/meta
+          if ($m.company -ne "CI Smoke Co") { throw "company not created" }
+          Invoke-RestMethod http://127.0.0.1:8765/api/shutdown -Method Post -Headers $h -ContentType "application/json" -Body '{}' | Out-Null
+          Write-Host "Frozen exe web mode OK"
       - name: Build installer
         shell: pwsh
         run: |
