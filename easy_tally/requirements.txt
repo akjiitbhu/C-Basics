@@ -1,3 +1,3 @@
 pdfplumber>=0.11
-# test-only (generates sample statement PDFs):
-# reportlab
+reportlab>=4.0
+openpyxl>=3.1

@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS stock_items (
 
 CREATE TABLE IF NOT EXISTS invoices (
     voucher_id INTEGER PRIMARY KEY REFERENCES vouchers(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL CHECK (kind IN ('Sales','Purchase')),
+    kind TEXT NOT NULL,                        -- Sales | Purchase | Credit Note | Debit Note
     party_id INTEGER NOT NULL REFERENCES ledgers(id),
     intra_state INTEGER NOT NULL,
     taxable INTEGER NOT NULL,
@@ -102,6 +102,20 @@ CREATE TABLE IF NOT EXISTS bank_txns (
     fingerprint TEXT NOT NULL UNIQUE
 );
 
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    user TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
+
+-- Vouchers brought in from Tally XML; the fingerprint stops a file being imported twice.
+CREATE TABLE IF NOT EXISTS tally_imports (
+    fingerprint TEXT PRIMARY KEY,
+    voucher_id INTEGER REFERENCES vouchers(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS bank_rules (
     id INTEGER PRIMARY KEY,
     keyword TEXT NOT NULL UNIQUE,              -- matched case-insensitively in narration
@@ -112,15 +126,26 @@ CREATE TABLE IF NOT EXISTS bank_rules (
 # (name, parent, nature)
 DEFAULT_GROUPS = [
     ("Capital Account", None, "Liability"),
+    ("Reserves & Surplus", "Capital Account", "Liability"),
     ("Loans (Liability)", None, "Liability"),
+    ("Secured Loans", "Loans (Liability)", "Liability"),
+    ("Unsecured Loans", "Loans (Liability)", "Liability"),
+    ("Bank OD A/c", "Loans (Liability)", "Liability"),
+
     ("Current Liabilities", None, "Liability"),
     ("Duties & Taxes", "Current Liabilities", "Liability"),
     ("Sundry Creditors", "Current Liabilities", "Liability"),
+    ("Provisions", "Current Liabilities", "Liability"),
     ("Fixed Assets", None, "Asset"),
+    ("Investments", None, "Asset"),
     ("Current Assets", None, "Asset"),
     ("Bank Accounts", "Current Assets", "Asset"),
     ("Cash-in-Hand", "Current Assets", "Asset"),
     ("Sundry Debtors", "Current Assets", "Asset"),
+    ("Deposits (Asset)", "Current Assets", "Asset"),
+    ("Loans & Advances (Asset)", "Current Assets", "Asset"),
+    ("Stock-in-Hand", "Current Assets", "Asset"),
+    ("Misc. Expenses (ASSET)", None, "Asset"),
     ("Suspense A/c", None, "Asset"),
     ("Sales Accounts", None, "Income"),
     ("Direct Incomes", None, "Income"),
@@ -184,6 +209,45 @@ def connect(path) -> sqlite3.Connection:
     return conn
 
 
+SCHEMA_VERSION = 1
+
+
+def migrate(conn: sqlite3.Connection):
+    """Bring an older company file up to date. Safe to run on every open."""
+    conn.executescript(SCHEMA)            # all CREATE ... IF NOT EXISTS
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < 1:
+        # v1: invoices.kind accepts Credit Note / Debit Note (old files had a CHECK on it).
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE name='invoices'").fetchone()
+        if row and "CHECK" in row[0]:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("""CREATE TABLE invoices_new (
+                voucher_id INTEGER PRIMARY KEY REFERENCES vouchers(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                party_id INTEGER NOT NULL REFERENCES ledgers(id),
+                intra_state INTEGER NOT NULL,
+                taxable INTEGER NOT NULL,
+                cgst INTEGER NOT NULL, sgst INTEGER NOT NULL, igst INTEGER NOT NULL,
+                total INTEGER NOT NULL)""")
+            conn.execute("INSERT INTO invoices_new SELECT * FROM invoices")
+            conn.execute("DROP TABLE invoices")
+            conn.execute("ALTER TABLE invoices_new RENAME TO invoices")
+            conn.execute("PRAGMA foreign_keys = ON")
+    _ensure_groups(conn)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.commit()
+
+
+def _ensure_groups(conn):
+    """Add any default groups missing from older files (does not touch existing ones)."""
+    ids = {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM groups")}
+    for gname, parent, nature in DEFAULT_GROUPS:
+        if gname not in ids:
+            cur = conn.execute("INSERT INTO groups(name, parent_id, nature) VALUES (?,?,?)",
+                               (gname, ids.get(parent), nature))
+            ids[gname] = cur.lastrowid
+
+
 def init_company(conn: sqlite3.Connection, name: str, state: str = "", gstin: str = ""):
     conn.executescript(SCHEMA)
     conn.executemany("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
@@ -199,4 +263,5 @@ def init_company(conn: sqlite3.Connection, name: str, state: str = "", gstin: st
         lids[lname] = cur.lastrowid
     for kw, lname in DEFAULT_RULES:
         conn.execute("INSERT INTO bank_rules(keyword, ledger_id) VALUES (?,?)", (kw, lids[lname]))
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()

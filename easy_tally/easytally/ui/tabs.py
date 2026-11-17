@@ -242,8 +242,8 @@ class InvoiceTab(BaseTab):
         self.party = tk.StringVar(); self.inv_no = tk.StringVar()
         self.party_combo = ttk.Combobox(head, textvariable=self.party, width=34)
         for col, (label, w) in enumerate([
-                ("Invoice type", ttk.Combobox(head, textvariable=self.kind, values=["Sales", "Purchase"],
-                                              state="readonly", width=10)),
+                ("Invoice type", ttk.Combobox(head, textvariable=self.kind, values=["Sales", "Purchase", "Credit Note", "Debit Note"],
+                                              state="readonly", width=12)),
                 ("Date (DD-MM-YYYY)", ttk.Entry(head, textvariable=self.idate, width=12)),
                 ("Party (debtor / creditor)", self.party_combo),
                 ("Invoice no.", ttk.Entry(head, textvariable=self.inv_no, width=16))]):

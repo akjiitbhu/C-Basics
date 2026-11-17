@@ -7,7 +7,7 @@ accountant or consultant who serves **many customers**, with **bank statement PD
 
 ```bash
 cd easy_tally
-pip install -r requirements.txt     # pdfplumber
+pip install -r requirements.txt     # pdfplumber, reportlab, openpyxl
 python run.py                        # needs Python 3.9+ with Tkinter
 ```
 Linux: if `import tkinter` fails, install it (`sudo apt install python3-tk`).
@@ -39,12 +39,18 @@ To build it yourself on Windows: run `build_windows.bat` in this folder.
 
 | Area | What it does |
 |---|---|
-| Multi-customer | Each customer company is its own SQLite file in `~/EasyTally/companies/` (override with `EASYTALLY_HOME`). Pick or create a company at start; back up by copying the file. |
-| Masters | Account groups (Tally-style defaults), ledgers with opening balances, GSTIN and state, stock items with HSN and GST rate. |
-| Vouchers | Payment, Receipt, Journal, Contra. Double entry is enforced: debits must equal credits. |
-| GST invoices | Sales and purchase invoices; CGST+SGST for same-state parties, IGST otherwise; stock movement recorded. |
-| **Bank statement import** | Choose a bank account, pick one or more statement PDFs. Rows are parsed, shown for review, then posted as Payment (withdrawal) or Receipt (deposit) vouchers. |
-| Reports | Day Book, Ledger Statement, Trial Balance, Profit & Loss, Balance Sheet, GST Summary, Stock Summary; all export to CSV (opens in Excel). |
+| Multi-customer | Each customer company is its own SQLite file in `~/EasyTally/companies/` (override with `EASYTALLY_HOME`). |
+| Masters | Tally-style groups, ledgers (opening balance, GSTIN, state), stock items (HSN, GST rate). GSTINs are format-checked. |
+| Vouchers | Payment, Receipt, Journal, Contra. Debits must equal credits. **Vouchers can be edited** in place (type and number are kept). |
+| GST documents | Sales and purchase invoices, **credit notes** (sales returns) and **debit notes** (purchase returns). CGST+SGST or IGST by state; stock follows. Invoices and notes can be edited. |
+| **PDF invoices** | One-click printable tax invoice / credit note / debit note with company details, HSN, tax split, amount in words (Indian system), bank details and terms. |
+| **Bank statement import** | Pick PDFs, review, map to ledgers, post as vouchers (details below). |
+| **Receivables and payables** | Ageing (0-30 / 31-60 / 61-90 / over 90 days) and bill-wise outstanding per customer or supplier, with receipts, payments and notes settled oldest-first (FIFO). |
+| **GST returns** | **GSTR-1** (B2B, B2C large and small, credit notes, HSN summary, document series) and **GSTR-3B** summary as JSON in the GST offline-tool layout, plus Excel working papers and a list of warnings (missing HSN, bad GSTIN, long invoice numbers...). |
+| **Tally exchange** | Export ledgers and vouchers as Tally XML; import a Tally XML export (groups, ledgers, opening balances, accounting vouchers). Imports are de-duplicated. |
+| **Backup and restore** | One-click zip backup of a company or all companies (consistent even while running). Restore as a copy, or replace (the old file is kept as `.bak`). |
+| **Users, roles, audit** | Browser version: sign-in required. Roles: admin (everything), accountant (enter, edit, delete data), viewer (reports only). Every change is written to a per-company audit trail. |
+| Reports | Day Book, Ledger, Trial Balance, P&L (with opening/closing stock), Balance Sheet, GST Summary, Stock Summary, the ageing reports, all exportable to CSV. |
 
 ## How bank statement import works
 
@@ -70,16 +76,41 @@ sample to `tests/` and extend `_locate_columns` or the text parser.
 ## Accounting notes
 
 - Amounts are stored as integer paise, never floats.
-- Stock is valued at weighted-average cost. The Profit & Loss includes opening and closing
-  stock, and the Balance Sheet includes stock-in-hand. Opening stock has no ledger, so include
-  its value in your capital or opening balances, or the Trial Balance shows a difference.
-- Not yet included: GST returns (GSTR-1/3B) files, e-invoice or e-way bill, TDS, payroll,
-  PDF invoice printing, user logins, editing of posted vouchers (delete and re-enter).
+- Stock is valued at weighted-average cost. Credit and debit notes reduce sales and purchases. P&L
+  includes opening and closing stock, and the Balance Sheet includes stock-in-hand. Opening stock has no
+  ledger, so include its value in capital or opening balances, or the Trial Balance shows a difference.
+- Outstanding bills use **FIFO settlement**: any receipt or payment settles the oldest open bill. There is
+  no manual "against reference" allocation.
+
+## Security model (browser version)
+
+- The server listens on `127.0.0.1` only, refuses other Host/Origin headers, and requires a custom header
+  on every change, so other websites open in your browser cannot read or alter your books.
+- Passwords are salted PBKDF2-SHA256 hashes in `users.db` (not inside company files). Five failed
+  sign-ins lock that username for a minute. Sessions are HttpOnly, SameSite=Strict cookies, and expire
+  after 12 idle hours. Signing out closes the open company.
+- **The desktop window has no sign-in.** Use the browser version if you need logins.
+- Forgot the admin password? Close EasyTally and delete `users.db` in the EasyTally folder. Accounts
+  reset; accounting data is untouched.
+- Only one company is open at a time on the server, shared by everyone signed in on that PC.
+
+## Known limits
+
+- **GST returns are prepared, not filed.** Always read the warnings, then validate the JSON in the GST
+  offline tool or portal: the portal's schema changes. Not covered: GSTR-2A/2B matching, RCM, composition
+  and SEZ/export cases, e-invoice IRN, e-way bills, TDS/TCS, GSTR-9.
+- **Tally exchange** covers ledgers and accounting vouchers only. Stock items, inventory entries and bill
+  references are not carried over, and imported sales are plain vouchers, so they do not feed the GST returns.
+  Tally's XML varies by version; test with a copy before relying on it.
+- Not included: payroll, cost centres, budgets, multi-currency, bank reconciliation screen, financial-year
+  closing, multi-PC or network use (one machine only).
+- The desktop window has the same books but not every new screen: editing vouchers and invoices, PDF
+  invoices, GST returns, Tally exchange, backup, users and audit are in the browser version. Credit/debit
+  notes and the new reports are available in both.
 
 ## Tests
 
 ```bash
-pip install reportlab       # only to generate sample PDFs for tests
 python -m unittest discover -s tests -t .
 ```
 The web tests start a real local server and check the JSON API and its security rules
@@ -93,6 +124,11 @@ easytally/
   accounting.py   Books: masters, vouchers, GST invoices, bank staging/posting
   bank_import.py  PDF statement parser and consistency checks
   gst.py          GST rates, state codes, CGST/SGST/IGST maths
+  gst_returns.py  GSTR-1 / GSTR-3B JSON and Excel
+  invoice_pdf.py  printable invoices, amount in words
+  tally_xml.py    Tally XML import and export
+  backup.py       backup / restore of company files
+  auth.py         users, roles, sessions (browser version)
   reports.py      all reports + CSV export
   ui/             Tkinter desktop screens (thin layer over the modules above)
   web/            offline browser version: api.py (JSON API), server.py (localhost server), static/index.html

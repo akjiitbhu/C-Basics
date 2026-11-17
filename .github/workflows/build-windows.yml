@@ -19,31 +19,52 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt reportlab pyinstaller
+        run: python -m pip install -r requirements.txt pyinstaller
       - name: Run tests
         run: python -m unittest discover -s tests -t .
       - name: Build EasyTally.exe
         run: >
           python -m PyInstaller --noconfirm --clean --windowed --name EasyTally
-          --collect-all pdfplumber --collect-all pdfminer --collect-all pypdfium2 --add-data "easytally/web/static;easytally/web/static" run.py
+          --collect-all pdfplumber --collect-all pdfminer --collect-all pypdfium2 --collect-all reportlab --collect-all openpyxl --add-data "easytally/web/static;easytally/web/static" run.py
       - name: Smoke-test the built exe in browser mode
         shell: pwsh
         run: |
+          $base = "http://127.0.0.1:8765"
+          $h = @{ "X-EasyTally" = "1" }
+          $s = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          function Call-Api($path, $obj) {
+            Invoke-RestMethod "$base$path" -Method Post -Headers $h -ContentType "application/json" `
+              -Body (ConvertTo-Json -Depth 6 -InputObject $obj) -WebSession $s
+          }
+          function Get-Bytes($path) { (Invoke-WebRequest "$base$path" -WebSession $s -UseBasicParsing).Content }
           $p = Start-Process dist\EasyTally\EasyTally.exe -ArgumentList "--web" -PassThru
           $ok = $false
           foreach ($i in 1..30) {
             Start-Sleep -Seconds 1
-            try { $r = Invoke-RestMethod http://127.0.0.1:8765/api/ping; if ($r.app -eq "EasyTally") { $ok = $true; break } } catch {}
+            try { $r = Invoke-RestMethod "$base/api/ping"; if ($r.app -eq "EasyTally") { $ok = $true; break } } catch {}
           }
           if (-not $ok) { throw "EasyTally --web did not start" }
-          $page = (Invoke-WebRequest http://127.0.0.1:8765/ -UseBasicParsing).Content
+          $page = (Invoke-WebRequest "$base/" -UseBasicParsing).Content
           if ($page -notmatch "EasyTally") { throw "UI page missing from bundle" }
-          $h = @{ "X-EasyTally" = "1" }
-          Invoke-RestMethod http://127.0.0.1:8765/api/company/create -Method Post -Headers $h -ContentType "application/json" -Body '{"name":"CI Smoke Co","state":"27"}' | Out-Null
-          $m = Invoke-RestMethod http://127.0.0.1:8765/api/meta
-          if ($m.company -ne "CI Smoke Co") { throw "company not created" }
-          Invoke-RestMethod http://127.0.0.1:8765/api/shutdown -Method Post -Headers $h -ContentType "application/json" -Body '{}' | Out-Null
-          Write-Host "Frozen exe web mode OK"
+          # nothing works before the first administrator exists, and everything works after sign-in
+          try { Invoke-RestMethod "$base/api/ledgers" | Out-Null; throw "API open without sign-in" } catch { if ($_.Exception.Message -eq "API open without sign-in") { throw } }
+          Call-Api "/api/auth/setup" @{ username = "ciadmin"; password = "ci-password-123" } | Out-Null
+          Call-Api "/api/company/create" @{ name = "CI Smoke Co"; state = "27" } | Out-Null
+          Call-Api "/api/settings" @{ gstin = "27ABCDE1234F1Z5"; address = "CI Street" } | Out-Null
+          $item = Call-Api "/api/items" @{ name = "Widget"; hsn = "8501"; gst_rate = 18 }
+          $cust = Call-Api "/api/ledgers" @{ name = "Cust"; group = "Sundry Debtors"; gstin = "29AAAAA0000A1Z5" }
+          $inv = Call-Api "/api/invoices" @{ kind = "Sales"; date = "2026-04-05"; party_id = $cust.id; ref = "CI-1"; lines = @(@{ item_id = $item.id; qty = "2"; rate = "500" }) }
+          # these exercise reportlab and openpyxl inside the frozen exe
+          $pdf = Get-Bytes "/api/invoice.pdf?id=$($inv.id)"
+          if ([System.Text.Encoding]::ASCII.GetString($pdf[0..3]) -ne "%PDF") { throw "invoice PDF not generated" }
+          $xl = Get-Bytes "/api/gst/gstr1.xlsx?month=2026-04"
+          if ([System.Text.Encoding]::ASCII.GetString($xl[0..1]) -ne "PK") { throw "GSTR-1 Excel not generated" }
+          $tm = Get-Bytes "/api/tally/masters.xml"
+          if ([System.Text.Encoding]::UTF8.GetString($tm) -notmatch "<LEDGER ") { throw "Tally XML not generated" }
+          $bk = Get-Bytes "/api/backup"
+          if ([System.Text.Encoding]::ASCII.GetString($bk[0..1]) -ne "PK") { throw "backup not generated" }
+          Call-Api "/api/shutdown" @{} | Out-Null
+          Write-Host "Frozen exe: web mode, sign-in, PDF, Excel, Tally XML and backup all OK"
       - name: Build installer
         shell: pwsh
         run: |

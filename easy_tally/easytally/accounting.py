@@ -9,6 +9,8 @@ from . import db
 from .gst import compute_gst, is_intra_state
 from .money import to_paise
 
+GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$")
+
 DATE_FORMATS = ["%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y", "%d-%m-%y", "%d/%m/%y", "%d.%m.%y",
                 "%Y-%m-%d", "%d %b %Y", "%d-%b-%Y", "%d-%b-%y", "%d %b %y",
                 "%d %B %Y", "%d-%B-%Y", "%b %d %Y"]
@@ -37,6 +39,8 @@ def fy_start(today: date = None) -> str:
 
 
 VOUCHER_TYPES = ["Payment", "Receipt", "Journal", "Contra"]
+INVOICE_KINDS = ["Sales", "Purchase", "Credit Note", "Debit Note"]
+SETTING_KEYS = ["name", "address", "phone", "email", "state", "gstin", "pan", "bank_details", "terms"]
 
 
 class Books:
@@ -45,6 +49,7 @@ class Books:
     def __init__(self, path):
         self.path = Path(path)
         self.conn = db.connect(self.path)
+        db.migrate(self.conn)
 
     # ---- company lifecycle -------------------------------------------------
     @classmethod
@@ -91,6 +96,34 @@ class Books:
     def company_name(self) -> str:
         return self.setting("name")
 
+    def settings(self) -> dict:
+        return {k: self.setting(k) for k in SETTING_KEYS}
+
+    def set_settings(self, values: dict):
+        """Update company details (printed on invoices and used for GST returns)."""
+        clean = {}
+        for k in SETTING_KEYS:
+            if k in values:
+                clean[k] = str(values[k]).strip()
+        if "name" in clean and not clean["name"]:
+            raise ValueError("Company name cannot be empty")
+        gstin = clean.get("gstin", "").upper()
+        if gstin and not GSTIN_RE.match(gstin):
+            raise ValueError("GSTIN looks wrong: it should be 15 characters, e.g. 27ABCDE1234F1Z5")
+        if "gstin" in clean:
+            clean["gstin"] = gstin
+        for k, v in clean.items():
+            self.conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", (k, v))
+        self.conn.commit()
+
+    def audit(self, user: str, action: str, detail: str = ""):
+        self.conn.execute("INSERT INTO audit_log(user, action, detail) VALUES (?,?,?)",
+                          (user or "", action, detail[:500]))
+        self.conn.commit()
+
+    def audit_log(self, limit: int = 300):
+        return self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
     # ---- masters -----------------------------------------------------------
     def groups(self):
         return self.conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
@@ -109,10 +142,15 @@ class Books:
         if amount < 0:
             raise ValueError("Opening balance must not be negative; choose Dr or Cr")
         signed = amount if side == "Dr" else -amount
+        gstin = gstin.strip().upper()
+        if gstin and not GSTIN_RE.match(gstin):
+            raise ValueError("GSTIN looks wrong: it should be 15 characters, e.g. 27ABCDE1234F1Z5")
+        if gstin and not state:
+            state = gstin[:2]            # first two digits of a GSTIN are the state code
         try:
             cur = self.conn.execute(
                 "INSERT INTO ledgers(name, group_id, opening, gstin, state) VALUES (?,?,?,?,?)",
-                (name, self.group_id(group), signed, gstin.strip().upper(), state))
+                (name, self.group_id(group), signed, gstin, state))
         except sqlite3.IntegrityError:
             raise ValueError(f"Ledger '{name}' already exists")
         self.conn.commit()
@@ -176,9 +214,7 @@ class Books:
                                 (vtype,)).fetchone()
         return row["n"]
 
-    def add_voucher(self, vtype, vdate, entries, narration="", ref="", _commit=True) -> int:
-        """entries: [(ledger_id, 'Dr'|'Cr', amount_in_rupees), ...]. Dr total must equal Cr total."""
-        iso = parse_date(vdate)
+    def _signed_entries(self, entries):
         signed = []
         for ledger_id, side, amount in entries:
             p = to_paise(amount)
@@ -194,6 +230,12 @@ class Books:
         diff = sum(a for _, a in signed)
         if diff != 0:
             raise ValueError(f"Voucher does not balance (difference {abs(diff) / 100:.2f})")
+        return signed
+
+    def add_voucher(self, vtype, vdate, entries, narration="", ref="", _commit=True) -> int:
+        """entries: [(ledger_id, 'Dr'|'Cr', amount_in_rupees), ...]. Dr total must equal Cr total."""
+        iso = parse_date(vdate)
+        signed = self._signed_entries(entries)
         number = self._next_number(vtype)
         cur = self.conn.execute(
             "INSERT INTO vouchers(vtype, number, date, narration, ref) VALUES (?,?,?,?,?)",
@@ -204,6 +246,50 @@ class Books:
         if _commit:
             self.conn.commit()
         return vid
+
+    def _is_invoice(self, voucher_id: int) -> bool:
+        return bool(self.conn.execute("SELECT 1 FROM invoices WHERE voucher_id=?", (voucher_id,)).fetchone())
+
+    def update_voucher(self, voucher_id, vdate, entries, narration="", ref=""):
+        """Edit a plain voucher in place (type and number are kept). Invoices use update_invoice."""
+        v = self.conn.execute("SELECT * FROM vouchers WHERE id=?", (voucher_id,)).fetchone()
+        if not v:
+            raise ValueError("Voucher not found")
+        if self._is_invoice(voucher_id):
+            raise ValueError("This is an invoice; edit it from the Invoices screen")
+        iso = parse_date(vdate)
+        signed = self._signed_entries(entries)
+        try:
+            self.conn.execute("UPDATE vouchers SET date=?, narration=?, ref=? WHERE id=?",
+                              (iso, narration.strip(), ref.strip(), voucher_id))
+            self.conn.execute("DELETE FROM entries WHERE voucher_id=?", (voucher_id,))
+            self.conn.executemany("INSERT INTO entries(voucher_id, ledger_id, amount) VALUES (?,?,?)",
+                                  [(voucher_id, lid, a) for lid, a in signed])
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_voucher(self, voucher_id: int):
+        """Everything needed to show an edit form. Invoices include their item lines."""
+        v = self.conn.execute("SELECT * FROM vouchers WHERE id=?", (voucher_id,)).fetchone()
+        if not v:
+            raise ValueError("Voucher not found")
+        out = {"id": v["id"], "vtype": v["vtype"], "number": v["number"], "date": v["date"],
+               "narration": v["narration"], "ref": v["ref"], "invoice": None,
+               "entries": [{"ledger_id": e["ledger_id"], "name": e["name"],
+                            "side": "Dr" if e["amount"] > 0 else "Cr", "amount": abs(e["amount"]) / 100}
+                           for e in self.conn.execute(
+                               "SELECT e.ledger_id, e.amount, l.name FROM entries e JOIN ledgers l "
+                               "ON l.id=e.ledger_id WHERE e.voucher_id=? ORDER BY e.id", (voucher_id,))]}
+        inv = self.conn.execute("SELECT * FROM invoices WHERE voucher_id=?", (voucher_id,)).fetchone()
+        if inv:
+            out["invoice"] = {"kind": inv["kind"], "party_id": inv["party_id"],
+                              "lines": [{"item_id": l["item_id"], "qty": l["qty"], "rate": l["rate"] / 100}
+                                        for l in self.conn.execute(
+                                            "SELECT * FROM invoice_lines WHERE voucher_id=? ORDER BY id",
+                                            (voucher_id,))]}
+        return out
 
     def delete_voucher(self, voucher_id: int):
         # Any staged bank row pointing at this voucher is released (ON DELETE SET NULL).
@@ -239,10 +325,20 @@ class Books:
         return {r["id"]: (r["opening"] if with_opening else 0) + r["movement"] for r in rows}
 
     # ---- invoices (GST) ----------------------------------------------------
+    @staticmethod
+    def _invoice_plan(kind):
+        """(main ledger, tax ledger prefix, party side, other side) for each document kind."""
+        plans = {"Sales": ("Sales", "Output", "Dr", "Cr"),
+                 "Purchase": ("Purchase", "Input", "Cr", "Dr"),
+                 "Credit Note": ("Sales", "Output", "Cr", "Dr"),      # sales return
+                 "Debit Note": ("Purchase", "Input", "Dr", "Cr")}     # purchase return
+        if kind not in plans:
+            raise ValueError("Invoice kind must be one of: " + ", ".join(INVOICE_KINDS))
+        return plans[kind]
+
     def preview_invoice(self, kind, party_id, lines):
         """lines: [(item_id, qty, rate_rupees)]. Returns dict with per-line and total tax figures."""
-        if kind not in ("Sales", "Purchase"):
-            raise ValueError("Invoice kind must be Sales or Purchase")
+        self._invoice_plan(kind)
         if not lines:
             raise ValueError("Add at least one item")
         party = self.get_ledger(party_id)
@@ -269,33 +365,62 @@ class Books:
         totals["total"] = sum(totals[k] for k in ("taxable", "cgst", "sgst", "igst"))
         return dict(intra_state=intra, lines=out_lines, **totals)
 
-    def add_invoice(self, kind, vdate, party_id, lines, narration="", ref="") -> int:
-        """Post a Sales or Purchase GST invoice as a balanced voucher plus stock lines."""
-        inv = self.preview_invoice(kind, party_id, lines)
-        prefix = "Output" if kind == "Sales" else "Input"
-        main = self.ledger_id("Sales" if kind == "Sales" else "Purchase")
-        party_side, other_side = ("Dr", "Cr") if kind == "Sales" else ("Cr", "Dr")
-        entries = [(party_id, party_side, inv["total"] / 100), (main, other_side, inv["taxable"] / 100)]
+    def _invoice_entries(self, kind, party_id, inv):
+        main_name, prefix, party_side, other_side = self._invoice_plan(kind)
+        entries = [(party_id, party_side, inv["total"] / 100),
+                   (self.ledger_id(main_name), other_side, inv["taxable"] / 100)]
         for tax in ("cgst", "sgst", "igst"):
             if inv[tax]:
                 entries.append((self.ledger_id(f"{prefix} {tax.upper()}"), other_side, inv[tax] / 100))
+        return entries
+
+    def _write_invoice_rows(self, vid, kind, party_id, inv):
+        self.conn.execute(
+            "INSERT INTO invoices(voucher_id, kind, party_id, intra_state, taxable, cgst, sgst, igst, total)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (vid, kind, party_id, int(inv["intra_state"]), inv["taxable"], inv["cgst"],
+             inv["sgst"], inv["igst"], inv["total"]))
+        self.conn.executemany(
+            "INSERT INTO invoice_lines(voucher_id, item_id, qty, rate, gst_rate, taxable, cgst, sgst, igst)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            [(vid, l["item_id"], l["qty"], l["rate"], l["gst_rate"], l["taxable"],
+              l["cgst"], l["sgst"], l["igst"]) for l in inv["lines"]])
+
+    def add_invoice(self, kind, vdate, party_id, lines, narration="", ref="") -> int:
+        """Post a Sales / Purchase invoice or a Credit / Debit Note as a balanced voucher + stock lines."""
+        inv = self.preview_invoice(kind, party_id, lines)
         try:
-            vid = self.add_voucher(kind, vdate, entries, narration, ref, _commit=False)
-            self.conn.execute(
-                "INSERT INTO invoices(voucher_id, kind, party_id, intra_state, taxable, cgst, sgst, igst, total)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
-                (vid, kind, party_id, int(inv["intra_state"]), inv["taxable"], inv["cgst"],
-                 inv["sgst"], inv["igst"], inv["total"]))
-            self.conn.executemany(
-                "INSERT INTO invoice_lines(voucher_id, item_id, qty, rate, gst_rate, taxable, cgst, sgst, igst)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
-                [(vid, l["item_id"], l["qty"], l["rate"], l["gst_rate"], l["taxable"],
-                  l["cgst"], l["sgst"], l["igst"]) for l in inv["lines"]])
+            vid = self.add_voucher(kind, vdate, self._invoice_entries(kind, party_id, inv),
+                                   narration, ref, _commit=False)
+            self._write_invoice_rows(vid, kind, party_id, inv)
             self.conn.commit()
         except Exception:
             self.conn.rollback()
             raise
         return vid
+
+    def update_invoice(self, voucher_id, vdate, party_id, lines, narration="", ref=""):
+        """Replace an invoice's party, items, date and reference. Type and number are kept."""
+        row = self.conn.execute("SELECT kind FROM invoices WHERE voucher_id=?", (voucher_id,)).fetchone()
+        if not row:
+            raise ValueError("Invoice not found")
+        kind = row["kind"]
+        inv = self.preview_invoice(kind, party_id, lines)
+        iso = parse_date(vdate)
+        signed = self._signed_entries(self._invoice_entries(kind, party_id, inv))
+        try:
+            self.conn.execute("UPDATE vouchers SET date=?, narration=?, ref=? WHERE id=?",
+                              (iso, narration.strip(), ref.strip(), voucher_id))
+            self.conn.execute("DELETE FROM entries WHERE voucher_id=?", (voucher_id,))
+            self.conn.executemany("INSERT INTO entries(voucher_id, ledger_id, amount) VALUES (?,?,?)",
+                                  [(voucher_id, lid, a) for lid, a in signed])
+            self.conn.execute("DELETE FROM invoice_lines WHERE voucher_id=?", (voucher_id,))
+            self.conn.execute("DELETE FROM invoices WHERE voucher_id=?", (voucher_id,))
+            self._write_invoice_rows(voucher_id, kind, party_id, inv)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     # ---- bank statement staging -------------------------------------------
     def suggest_ledger(self, narration: str):

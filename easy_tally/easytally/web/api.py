@@ -1,21 +1,30 @@
-"""JSON API over the accounting engine. Pure Python (no HTTP) so it is easy to test."""
+"""JSON API over the accounting engine. Pure Python (no HTTP) so it is easy to test.
+
+Every route declares the permission it needs: None (public), "auth" (any signed-in user),
+or one of read / write / delete / admin, which roles map to in auth.ROLE_PERMS.
+"""
 import csv
 import io
+import json
 import os
 import tempfile
 import threading
+from calendar import monthrange
 
-from .. import reports
-from ..accounting import Books, VOUCHER_TYPES, display_date
+from .. import auth, backup, db, gst_returns, reports, tally_xml
+from ..accounting import INVOICE_KINDS, Books, display_date, parse_date
 from ..bank_import import StatementError, check_consistency, parse_statement
 from ..gst import GST_RATES, STATES
+from ..invoice_pdf import invoice_pdf
+from ..accounting import VOUCHER_TYPES
 from ..money import fmt, fmt_dr_cr
 
 
 class ApiError(Exception):
-    def __init__(self, message, status=400):
+    def __init__(self, message, status=400, **extra):
         super().__init__(message)
         self.status = status
+        self.extra = extra
 
 
 def _int(v, what="id"):
@@ -25,10 +34,21 @@ def _int(v, what="id"):
         raise ApiError(f"Invalid {what}")
 
 
+class Ctx:
+    """Per-request context (the API lock guarantees one request at a time)."""
+    def __init__(self, user=None):
+        self.user = user          # sqlite Row from UserStore or None
+        self.cookie = None        # ("set", token) | ("clear", None)
+        self.token = None
+
+
 class Api:
-    def __init__(self):
+    def __init__(self, users_path=None, iterations=auth.ITERATIONS):
         self.books = None
-        self.lock = threading.Lock()      # sqlite connection is shared across server threads
+        self.lock = threading.Lock()      # sqlite connections are shared across server threads
+        self.users = auth.UserStore(users_path or (db.home_dir() / "users.db"), iterations)
+        self.sessions = auth.Sessions()
+        self.ctx = Ctx()
 
     # ---- helpers -----------------------------------------------------------
     def _b(self) -> Books:
@@ -36,28 +56,114 @@ class Api:
             raise ApiError("No company is open", 409)
         return self.books
 
-    def handle(self, method, path, query, body=None, raw=None):
-        """Returns (status, payload). payload is a dict/list, or (content_type, bytes) for files."""
+    @property
+    def username(self):
+        return self.ctx.user["username"] if self.ctx.user else ""
+
+    def handle(self, method, path, query, body=None, raw=None, token=None):
+        """Returns (status, payload, cookie). payload is JSON-able or (content_type, bytes, filename)."""
         route = ROUTES.get((method, path))
         if not route:
-            return 404, {"error": "Not found"}
-        try:
-            with self.lock:
-                return 200, route(self, query, body or {}, raw)
-        except ApiError as e:
-            return e.status, {"error": str(e)}
-        except ValueError as e:        # validation errors raised by the engine
-            return 400, {"error": str(e)}
+            return 404, {"error": "Not found"}, None
+        func, perm = route
+        with self.lock:
+            user = None
+            name = self.sessions.get(token)
+            if name:
+                user = self.users.get(name)
+                if not user or user["disabled"]:
+                    self.sessions.destroy(token)
+                    user = None
+            ctx = self.ctx = Ctx(user)
+            ctx.token = token
+            try:
+                if perm is not None:
+                    if not self.users.has_users():
+                        raise ApiError("Create the first administrator account to begin.", 401, setup=True)
+                    if not user:
+                        raise ApiError("Please sign in.", 401)
+                    if perm != "auth" and perm not in auth.ROLE_PERMS[user["role"]]:
+                        raise ApiError("Your role does not allow this action.", 403)
+                result = func(self, query, body or {}, raw)
+                if method == "POST" and path in AUDITED and self.books and user:   # changes only, never plain views
+                    info = body if body else query
+                    self.books.audit(self.username, AUDITED[path], json.dumps(info, default=str)[:400] if info else "")
+                return 200, result, ctx.cookie
+            except ApiError as e:
+                return e.status, {"error": str(e), **e.extra}, ctx.cookie
+            except (ValueError, auth.AuthError) as e:     # validation errors raised by the engine
+                return 400, {"error": str(e)}, ctx.cookie
+
+    # ---- authentication ------------------------------------------------------
+    def auth_status(self, q, body, raw):
+        u = self.ctx.user
+        return {"setup_needed": not self.users.has_users(),
+                "user": {"username": u["username"], "role": u["role"]} if u else None}
+
+    def _login_as(self, user):
+        self.ctx.cookie = ("set", self.sessions.create(user["username"]))
+        return {"username": user["username"], "role": user["role"]}
+
+    def auth_setup(self, q, body, raw):
+        if self.users.has_users():
+            raise ApiError("An administrator already exists.", 403)
+        self.users.create(body.get("username", ""), body.get("password", ""), "admin")
+        return self._login_as(self.users.get(body["username"].strip()))
+
+    def auth_login(self, q, body, raw):
+        if not self.users.has_users():
+            raise ApiError("Create the first administrator account to begin.", 401, setup=True)
+        return self._login_as(self.users.verify(body.get("username", ""), body.get("password", "")))
+
+    def auth_logout(self, q, body, raw):
+        self.sessions.destroy(self.ctx.token)
+        self._close()                       # the open company belongs to the signed-in session
+        self.ctx.cookie = ("clear", None)
+        return {"ok": True}
+
+    def auth_password(self, q, body, raw):
+        u = self.ctx.user
+        if not auth.check_password(body.get("old", ""), u["password_hash"]):
+            raise ApiError("Current password is wrong.")
+        self.users.update(u["id"], password=body.get("new", ""))
+        return {"ok": True}
+
+    # ---- user administration ---------------------------------------------------
+    def users_list(self, q, body, raw):
+        return self.users.list()
+
+    def user_add(self, q, body, raw):
+        return {"id": self.users.create(body.get("username", ""), body.get("password", ""), body.get("role", "viewer"))}
+
+    def user_update(self, q, body, raw):
+        uid = _int(body.get("id"))
+        target = self.users.get_id(uid)
+        self.users.update(uid, role=body.get("role"), password=body.get("password") or None,
+                          disabled=body.get("disabled"))
+        if target:
+            self.sessions.drop_user(target["username"])         # force re-login with the new settings
+        return {"ok": True}
+
+    def user_delete(self, q, body, raw):
+        uid = _int(body.get("id"))
+        target = self.users.get_id(uid)
+        if target and target["username"].lower() == self.username.lower():
+            raise ApiError("You cannot delete your own account.")
+        self.users.delete(uid)
+        if target:
+            self.sessions.drop_user(target["username"])
+        return {"ok": True}
 
     # ---- company -----------------------------------------------------------
     def ping(self, q, body, raw):
         return {"ok": True, "app": "EasyTally"}
 
     def meta(self, q, body, raw):
-        return {"company": self.books.company_name if self.books else None,
+        signed_in = self.ctx.user is not None
+        return {"company": self.books.company_name if (self.books and signed_in) else None,
                 "states": [{"code": c, "name": n} for c, n in STATES.items()],
-                "vtypes": VOUCHER_TYPES, "gst_rates": GST_RATES,
-                "groups": [g["name"] for g in self.books.groups()] if self.books else [],
+                "vtypes": VOUCHER_TYPES, "invoice_kinds": INVOICE_KINDS, "gst_rates": GST_RATES,
+                "groups": [g["name"] for g in self.books.groups()] if (self.books and signed_in) else [],
                 "reports": reports.REPORT_NAMES}
 
     def companies(self, q, body, raw):
@@ -83,6 +189,13 @@ class Api:
 
     def company_close(self, q, body, raw):
         self._close()
+        return {"ok": True}
+
+    def settings_get(self, q, body, raw):
+        return self._b().settings()
+
+    def settings_set(self, q, body, raw):
+        self._b().set_settings(body)
         return {"ok": True}
 
     # ---- masters -----------------------------------------------------------
@@ -123,15 +236,32 @@ class Api:
             out.append({"id": v["id"], "date": display_date(v["date"]), "vtype": v["vtype"],
                         "number": v["number"], "particulars": " / ".join(e["name"] for e in es),
                         "amount": fmt(sum(e["amount"] for e in es if e["amount"] > 0)),
-                        "narration": v["narration"]})
+                        "narration": v["narration"], "invoice": b._is_invoice(v["id"])})
         return out
 
+    def voucher_get(self, q, body, raw):
+        v = self._b().get_voucher(_int(q.get("id")))
+        for e in v["entries"]:
+            e["amount"] = f"{e['amount']:.2f}"
+        if v["invoice"]:
+            for l in v["invoice"]["lines"]:
+                l["rate"] = f"{l['rate']:.2f}"
+                l["qty"] = f"{l['qty']:g}"
+        return v
+
+    @staticmethod
+    def _voucher_lines(body):
+        return [(_int(l.get("ledger_id"), "ledger"), l.get("side"), l.get("amount")) for l in body.get("lines", [])]
+
     def voucher_add(self, q, body, raw):
-        lines = [(_int(l.get("ledger_id"), "ledger"), l.get("side"), l.get("amount"))
-                 for l in body.get("lines", [])]
-        vid = self._b().add_voucher(body.get("vtype", ""), body.get("date", ""), lines,
+        vid = self._b().add_voucher(body.get("vtype", ""), body.get("date", ""), self._voucher_lines(body),
                                     body.get("narration", ""), body.get("ref", ""))
         return {"id": vid}
+
+    def voucher_update(self, q, body, raw):
+        self._b().update_voucher(_int(body.get("id")), body.get("date", ""), self._voucher_lines(body),
+                                 body.get("narration", ""), body.get("ref", ""))
+        return {"ok": True}
 
     def voucher_delete(self, q, body, raw):
         for i in body.get("ids", []):
@@ -157,6 +287,11 @@ class Api:
                                     self._inv_lines(body), ref=body.get("ref", ""))
         return {"id": vid}
 
+    def invoice_update(self, q, body, raw):
+        self._b().update_invoice(_int(body.get("id")), body.get("date", ""), _int(body.get("party_id"), "party"),
+                                 self._inv_lines(body), ref=body.get("ref", ""))
+        return {"ok": True}
+
     def invoices(self, q, body, raw):
         rows = self._b().conn.execute(
             """SELECT v.id, v.date, v.number, v.ref, i.*, l.name pname FROM invoices i
@@ -165,6 +300,14 @@ class Api:
         return [{"id": r["id"], "date": display_date(r["date"]), "kind": r["kind"], "number": r["number"],
                  "ref": r["ref"], "party": r["pname"], "taxable": fmt(r["taxable"]), "cgst": fmt(r["cgst"]),
                  "sgst": fmt(r["sgst"]), "igst": fmt(r["igst"]), "total": fmt(r["total"])} for r in rows]
+
+    def invoice_pdf(self, q, body, raw):
+        vid = _int(q.get("id"))
+        b = self._b()
+        v = b.conn.execute("SELECT number, ref FROM vouchers WHERE id=?", (vid,)).fetchone()
+        data = invoice_pdf(b, vid)
+        name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (v["ref"] or f"{v['number']}"))
+        return ("application/pdf", data, f"invoice_{name}.pdf")
 
     # ---- bank statements ---------------------------------------------------
     def bank_accounts(self, q, body, raw):
@@ -215,7 +358,6 @@ class Api:
 
     # ---- reports -----------------------------------------------------------
     def _report(self, q):
-        from ..accounting import parse_date
         return reports.run_report(self._b(), q.get("name", ""), parse_date(q.get("start", "")),
                                   parse_date(q.get("end", "")), q.get("ledger_id") or None)
 
@@ -228,23 +370,126 @@ class Api:
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow([r.title]); w.writerow(r.columns); w.writerows(r.rows)
-        return ("text/csv; charset=utf-8", ("﻿" + buf.getvalue()).encode("utf-8"))
+        return ("text/csv; charset=utf-8", ("\ufeff" + buf.getvalue()).encode("utf-8"), "report.csv")
+
+    # ---- GST returns ---------------------------------------------------------
+    @staticmethod
+    def _month(q):
+        try:
+            y, m = q.get("month", "").split("-")
+            return int(y), int(m)
+        except ValueError:
+            raise ApiError("Choose a month")
+
+    def gst_check(self, q, body, raw):
+        y, m = self._month(q)
+        d1, w1 = gst_returns.gstr1(self._b(), y, m)
+        d3, payable, w3 = gst_returns.gstr3b(self._b(), y, m)
+        return {"warnings": list(dict.fromkeys(w1 + w3)),
+                "counts": {"b2b_invoices": sum(len(x["inv"]) for x in d1["b2b"]),
+                           "b2cl_invoices": sum(len(x["inv"]) for x in d1["b2cl"]),
+                           "b2cs_rows": len(d1["b2cs"]), "credit_notes": sum(len(x["nt"]) for x in d1["cdnr"]) + len(d1["cdnur"]),
+                           "hsn_rows": len(d1["hsn"]["data"])},
+                "gstr3b": {"taxable": d3["sup_details"]["osup_det"]["txval"], "igst": d3["sup_details"]["osup_det"]["iamt"],
+                           "cgst": d3["sup_details"]["osup_det"]["camt"], "sgst": d3["sup_details"]["osup_det"]["samt"],
+                           "itc": d3["itc_elg"]["itc_net"], "payable": payable}}
+
+    def gstr1_json(self, q, body, raw):
+        y, m = self._month(q)
+        data, _ = gst_returns.gstr1(self._b(), y, m)
+        return ("application/json", json.dumps(data, indent=1).encode("utf-8"), f"GSTR1_{m:02d}{y}.json")
+
+    def gstr1_xlsx(self, q, body, raw):
+        y, m = self._month(q)
+        data, w = gst_returns.gstr1(self._b(), y, m)
+        return (XLSX, gst_returns.gstr1_xlsx(data, w), f"GSTR1_{m:02d}{y}.xlsx")
+
+    def gstr3b_json(self, q, body, raw):
+        y, m = self._month(q)
+        data, _, _ = gst_returns.gstr3b(self._b(), y, m)
+        return ("application/json", json.dumps(data, indent=1).encode("utf-8"), f"GSTR3B_{m:02d}{y}.json")
+
+    def gstr3b_xlsx(self, q, body, raw):
+        y, m = self._month(q)
+        data, pay, w = gst_returns.gstr3b(self._b(), y, m)
+        return (XLSX, gst_returns.gstr3b_xlsx(data, pay, w), f"GSTR3B_{m:02d}{y}.xlsx")
+
+    # ---- Tally exchange -------------------------------------------------------
+    def tally_masters(self, q, body, raw):
+        return ("application/xml", tally_xml.export_masters(self._b()), "Tally_masters.xml")
+
+    def tally_vouchers(self, q, body, raw):
+        start = parse_date(q["start"]) if q.get("start") else None
+        end = parse_date(q["end"]) if q.get("end") else None
+        return ("application/xml", tally_xml.export_vouchers(self._b(), start, end), "Tally_vouchers.xml")
+
+    def tally_import(self, q, body, raw):
+        if not raw:
+            raise ApiError("No file received.")
+        return tally_xml.import_xml(self._b(), raw)
+
+    # ---- backup / restore / audit ---------------------------------------------
+    def backup_company(self, q, body, raw):
+        b = self._b()
+        return ("application/zip", backup.backup_company(b), f"EasyTally_backup_{b.path.stem}.zip")
+
+    def backup_all(self, q, body, raw):
+        return ("application/zip", backup.backup_all(), "EasyTally_backup_all.zip")
+
+    def restore(self, q, body, raw):
+        if not raw:
+            raise ApiError("No file received.")
+        if self.books:                       # release the open file so it can be replaced safely
+            self._close()
+        return {"restored": backup.restore(raw, overwrite=q.get("overwrite") == "1")}
+
+    def audit_list(self, q, body, raw):
+        return [{"time": r["ts"], "user": r["user"], "action": r["action"], "detail": r["detail"]}
+                for r in self._b().audit_log()]
 
 
+
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+# (method, path) -> (handler, permission)
 ROUTES = {
-    ("GET", "/api/ping"): Api.ping, ("GET", "/api/meta"): Api.meta,
-    ("GET", "/api/companies"): Api.companies, ("POST", "/api/company/create"): Api.company_create,
-    ("POST", "/api/company/open"): Api.company_open, ("POST", "/api/company/close"): Api.company_close,
-    ("GET", "/api/ledgers"): Api.ledgers, ("POST", "/api/ledgers"): Api.ledger_add,
-    ("POST", "/api/ledgers/delete"): Api.ledger_delete,
-    ("GET", "/api/items"): Api.items, ("POST", "/api/items"): Api.item_add,
-    ("POST", "/api/items/delete"): Api.item_delete,
-    ("GET", "/api/vouchers"): Api.vouchers, ("POST", "/api/vouchers"): Api.voucher_add,
-    ("POST", "/api/vouchers/delete"): Api.voucher_delete,
-    ("GET", "/api/invoices"): Api.invoices, ("POST", "/api/invoices"): Api.invoice_add,
-    ("POST", "/api/invoices/preview"): Api.invoice_preview,
-    ("GET", "/api/bank/accounts"): Api.bank_accounts, ("GET", "/api/bank/txns"): Api.bank_txns,
-    ("POST", "/api/bank/import"): Api.bank_import, ("POST", "/api/bank/set_ledger"): Api.bank_set_ledger,
-    ("POST", "/api/bank/post"): Api.bank_post,
-    ("GET", "/api/report"): Api.report, ("GET", "/api/report.csv"): Api.report_csv,
+    ("GET", "/api/ping"): (Api.ping, None), ("GET", "/api/meta"): (Api.meta, None),
+    ("GET", "/api/auth/status"): (Api.auth_status, None), ("POST", "/api/auth/setup"): (Api.auth_setup, None),
+    ("POST", "/api/auth/login"): (Api.auth_login, None), ("POST", "/api/auth/logout"): (Api.auth_logout, "auth"),
+    ("POST", "/api/auth/password"): (Api.auth_password, "auth"),
+    ("GET", "/api/users"): (Api.users_list, "admin"), ("POST", "/api/users"): (Api.user_add, "admin"),
+    ("POST", "/api/users/update"): (Api.user_update, "admin"), ("POST", "/api/users/delete"): (Api.user_delete, "admin"),
+    ("GET", "/api/companies"): (Api.companies, "read"), ("POST", "/api/company/create"): (Api.company_create, "admin"),
+    ("POST", "/api/company/open"): (Api.company_open, "read"), ("POST", "/api/company/close"): (Api.company_close, "read"),
+    ("GET", "/api/settings"): (Api.settings_get, "read"), ("POST", "/api/settings"): (Api.settings_set, "admin"),
+    ("GET", "/api/ledgers"): (Api.ledgers, "read"), ("POST", "/api/ledgers"): (Api.ledger_add, "write"),
+    ("POST", "/api/ledgers/delete"): (Api.ledger_delete, "delete"),
+    ("GET", "/api/items"): (Api.items, "read"), ("POST", "/api/items"): (Api.item_add, "write"),
+    ("POST", "/api/items/delete"): (Api.item_delete, "delete"),
+    ("GET", "/api/vouchers"): (Api.vouchers, "read"), ("GET", "/api/voucher"): (Api.voucher_get, "read"),
+    ("POST", "/api/vouchers"): (Api.voucher_add, "write"), ("POST", "/api/vouchers/update"): (Api.voucher_update, "write"),
+    ("POST", "/api/vouchers/delete"): (Api.voucher_delete, "delete"),
+    ("GET", "/api/invoices"): (Api.invoices, "read"), ("POST", "/api/invoices"): (Api.invoice_add, "write"),
+    ("POST", "/api/invoices/update"): (Api.invoice_update, "write"),
+    ("POST", "/api/invoices/preview"): (Api.invoice_preview, "read"), ("GET", "/api/invoice.pdf"): (Api.invoice_pdf, "read"),
+    ("GET", "/api/bank/accounts"): (Api.bank_accounts, "read"), ("GET", "/api/bank/txns"): (Api.bank_txns, "read"),
+    ("POST", "/api/bank/import"): (Api.bank_import, "write"), ("POST", "/api/bank/set_ledger"): (Api.bank_set_ledger, "write"),
+    ("POST", "/api/bank/post"): (Api.bank_post, "write"),
+    ("GET", "/api/report"): (Api.report, "read"), ("GET", "/api/report.csv"): (Api.report_csv, "read"),
+    ("GET", "/api/gst/check"): (Api.gst_check, "read"),
+    ("GET", "/api/gst/gstr1.json"): (Api.gstr1_json, "read"), ("GET", "/api/gst/gstr1.xlsx"): (Api.gstr1_xlsx, "read"),
+    ("GET", "/api/gst/gstr3b.json"): (Api.gstr3b_json, "read"), ("GET", "/api/gst/gstr3b.xlsx"): (Api.gstr3b_xlsx, "read"),
+    ("GET", "/api/tally/masters.xml"): (Api.tally_masters, "read"), ("GET", "/api/tally/vouchers.xml"): (Api.tally_vouchers, "read"),
+    ("POST", "/api/tally/import"): (Api.tally_import, "admin"),
+    ("GET", "/api/backup"): (Api.backup_company, "admin"), ("GET", "/api/backup/all"): (Api.backup_all, "admin"),
+    ("POST", "/api/restore"): (Api.restore, "admin"), ("GET", "/api/audit"): (Api.audit_list, "admin"),
+}
+
+# Changes that are written to the company's audit trail (who did what).
+AUDITED = {
+    "/api/ledgers": "Ledger added", "/api/ledgers/delete": "Ledger deleted", "/api/items": "Stock item added",
+    "/api/items/delete": "Stock item deleted", "/api/vouchers": "Voucher added", "/api/vouchers/update": "Voucher edited",
+    "/api/vouchers/delete": "Voucher deleted", "/api/invoices": "Invoice added", "/api/invoices/update": "Invoice edited",
+    "/api/bank/import": "Bank statement imported", "/api/bank/post": "Bank rows posted",
+    "/api/tally/import": "Tally XML imported", "/api/settings": "Company details changed",
 }

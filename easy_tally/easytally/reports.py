@@ -156,6 +156,11 @@ def balance_sheet(b: Books, as_on) -> Report:
     return r
 
 
+KIND_LABEL = {"Sales": "Sales (output)", "Credit Note": "Credit Note (reduces output)",
+              "Purchase": "Purchase (input)", "Debit Note": "Debit Note (reduces input)"}
+KIND_ORDER = {"Sales": 0, "Credit Note": 1, "Purchase": 2, "Debit Note": 3}
+
+
 def gst_summary(b: Books, start, end) -> Report:
     r = Report(f"GST Summary  {display_date(start)} to {display_date(end)}",
                ["Kind", "GST %", "Taxable", "CGST", "SGST", "IGST"])
@@ -163,19 +168,22 @@ def gst_summary(b: Books, start, end) -> Report:
         """SELECT i.kind, l.gst_rate, SUM(l.taxable) t, SUM(l.cgst) c, SUM(l.sgst) s, SUM(l.igst) g
            FROM invoice_lines l JOIN invoices i ON i.voucher_id = l.voucher_id
            JOIN vouchers v ON v.id = i.voucher_id
-           WHERE v.date BETWEEN ? AND ? GROUP BY i.kind, l.gst_rate ORDER BY i.kind DESC, l.gst_rate""",
-        (start, end)).fetchall()
-    tot = {"Sales": [0, 0, 0], "Purchase": [0, 0, 0]}
+           WHERE v.date BETWEEN ? AND ? GROUP BY i.kind, l.gst_rate""", (start, end)).fetchall()
+    rows = sorted(rows, key=lambda x: (KIND_ORDER.get(x["kind"], 9), x["gst_rate"]))
+    out = [0, 0, 0]      # net output tax: Sales - Credit Notes
+    inp = [0, 0, 0]      # net input tax:  Purchase - Debit Notes
     for x in rows:
-        r.rows.append([x["kind"] + (" (output)" if x["kind"] == "Sales" else " (input)"),
-                       f"{x['gst_rate']}%", fmt(x["t"]), fmt(x["c"]), fmt(x["s"]), fmt(x["g"])])
+        r.rows.append([KIND_LABEL.get(x["kind"], x["kind"]), f"{x['gst_rate']}%", fmt(x["t"]),
+                       fmt(x["c"]), fmt(x["s"]), fmt(x["g"])])
+        sign = -1 if x["kind"] in ("Credit Note", "Debit Note") else 1
+        bucket = out if x["kind"] in ("Sales", "Credit Note") else inp
         for i, k in enumerate(("c", "s", "g")):
-            tot[x["kind"]][i] += x[k]
+            bucket[i] += sign * x[k]
     for i, name in enumerate(("CGST", "SGST", "IGST")):
-        net = tot["Sales"][i] - tot["Purchase"][i]
-        r.rows.append([f"Net {name} payable" if net >= 0 else f"Net {name} credit", "", "",
-                       fmt(abs(net)) if i == 0 else "", fmt(abs(net)) if i == 1 else "",
-                       fmt(abs(net)) if i == 2 else ""])
+        net = out[i] - inp[i]
+        cells = ["", "", ""]
+        cells[i] = fmt(abs(net))
+        r.rows.append([f"Net {name} payable" if net >= 0 else f"Net {name} credit", "", ""] + cells)
     return r
 
 
@@ -191,9 +199,13 @@ def stock_positions(b: Books, as_on):
                JOIN invoices i ON i.voucher_id=l.voucher_id JOIN vouchers v ON v.id=i.voucher_id
                WHERE l.item_id=? AND v.date <= ? GROUP BY i.kind""", (it["id"], as_on)).fetchall()
         d = {x["kind"]: x for x in q}
-        pq = d["Purchase"]["q"] if "Purchase" in d else 0
-        pv = d["Purchase"]["t"] if "Purchase" in d else 0
-        sq = d["Sales"]["q"] if "Sales" in d else 0
+
+        def g(kind, f):
+            return d[kind][f] if kind in d else 0
+        # Debit notes (purchase returns) reduce purchases; credit notes (sales returns) reduce sales.
+        pq = g("Purchase", "q") - g("Debit Note", "q")
+        pv = g("Purchase", "t") - g("Debit Note", "t")
+        sq = g("Sales", "q") - g("Credit Note", "q")
         in_qty = it["opening_qty"] + pq
         avg = (it["opening_value"] + pv) / in_qty if in_qty else 0
         close = in_qty - sq
@@ -217,6 +229,83 @@ def stock_summary(b: Books, as_on) -> Report:
     return r
 
 
+BUCKETS = [("0-30", 0, 30), ("31-60", 31, 60), ("61-90", 61, 90), ("Over 90", 91, 10 ** 6)]
+
+
+def party_bills(b: Books, ledger_id: int, as_on: str):
+    """Open bills for a debtor/creditor using FIFO settlement.
+
+    Bills are entries on the party's natural side (Dr for debtors, Cr for creditors): invoices,
+    debit/credit adjustments and the opening balance. Entries on the other side (receipts, payments,
+    credit/debit notes) settle the oldest bills first. Returns (open_bills, advance_paise) where each
+    bill is dict(date, label, amount, pending, age) and `advance` is unmatched settlement.
+    """
+    from datetime import date
+    led = b.get_ledger(ledger_id)
+    sign = 1 if led["group_name"] == "Sundry Debtors" else -1
+    bills, settle = [], 0
+    if led["opening"] * sign > 0:
+        bills.append({"date": None, "label": "Opening balance", "amount": abs(led["opening"])})
+    elif led["opening"] * sign < 0:
+        settle += abs(led["opening"])
+    rows = b.conn.execute(
+        """SELECT v.date, v.vtype, v.number, v.ref, e.amount FROM entries e JOIN vouchers v ON v.id=e.voucher_id
+           WHERE e.ledger_id=? AND v.date <= ? ORDER BY v.date, v.id, e.id""", (ledger_id, as_on)).fetchall()
+    for x in rows:
+        amt = x["amount"] * sign
+        if amt > 0:
+            bills.append({"date": x["date"], "amount": amt,
+                          "label": x["ref"] or f"{x['vtype']} {x['number']}"})
+        else:
+            settle += -amt
+    today = date.fromisoformat(as_on)
+    for bill in bills:
+        use = min(bill["amount"], settle)
+        bill["pending"] = bill["amount"] - use
+        settle -= use
+        bill["age"] = (today - date.fromisoformat(bill["date"])).days if bill["date"] else None
+    return [x for x in bills if x["pending"] > 0], settle
+
+
+def ageing(b: Books, as_on, receivable=True) -> Report:
+    group = "Sundry Debtors" if receivable else "Sundry Creditors"
+    r = Report(f"{'Receivables' if receivable else 'Payables'} Ageing as on {display_date(as_on)}",
+               ["Party", "Outstanding"] + [n for n, _, _ in BUCKETS] + ["Advance"])
+    tot = [0] * (len(BUCKETS) + 2)
+    for led in b.ledgers(group):
+        open_bills, advance = party_bills(b, led["id"], as_on)
+        cells = [0] * len(BUCKETS)
+        for bill in open_bills:
+            age = bill["age"] if bill["age"] is not None else 10 ** 6      # opening balance -> oldest
+            for i, (_, lo, hi) in enumerate(BUCKETS):
+                if lo <= age <= hi:
+                    cells[i] += bill["pending"]
+                    break
+        pending = sum(cells)
+        if not pending and not advance:
+            continue
+        r.rows.append([led["name"], fmt(pending)] + [fmt(c) if c else "" for c in cells]
+                      + [fmt(advance) if advance else ""])
+        for i, v in enumerate([pending] + cells + [advance]):
+            tot[i] += v
+    r.rows.append(["TOTAL"] + [fmt(v) for v in tot])
+    return r
+
+
+def outstanding_bills(b: Books, ledger_id: int, as_on) -> Report:
+    led = b.get_ledger(ledger_id)
+    r = Report(f"Outstanding bills: {led['name']} as on {display_date(as_on)}",
+               ["Date", "Bill", "Amount", "Pending", "Age (days)"])
+    bills, advance = party_bills(b, ledger_id, as_on)
+    for x in bills:
+        r.rows.append([display_date(x["date"]) if x["date"] else "", x["label"], fmt(x["amount"]),
+                       fmt(x["pending"]), "" if x["age"] is None else x["age"]])
+    r.rows.append(["", "TOTAL PENDING", "", fmt(sum(x["pending"] for x in bills)), ""])
+    if advance:
+        r.rows.append(["", "Advance / on account", "", fmt(advance), ""])
+    return r
+
+
 def bank_ledger_check(b: Books, bank_ledger_id: int) -> Report:
     """Staged bank rows not yet posted - quick view of what still needs a ledger."""
     r = Report("Unposted bank transactions", ["Date", "Narration", "Debit", "Credit", "Ledger"])
@@ -235,7 +324,7 @@ def export_csv(report: Report, path):
 
 
 REPORT_NAMES = ["Day Book", "Ledger Statement", "Trial Balance", "Profit & Loss", "Balance Sheet",
-                "GST Summary", "Stock Summary"]
+                "GST Summary", "Stock Summary", "Receivables Ageing", "Payables Ageing", "Outstanding Bills"]
 
 
 def run_report(b: Books, name: str, start: str, end: str, ledger_id=None) -> Report:
@@ -256,4 +345,12 @@ def run_report(b: Books, name: str, start: str, end: str, ledger_id=None) -> Rep
         return gst_summary(b, start, end)
     if name == "Stock Summary":
         return stock_summary(b, end)
+    if name == "Receivables Ageing":
+        return ageing(b, end, True)
+    if name == "Payables Ageing":
+        return ageing(b, end, False)
+    if name == "Outstanding Bills":
+        if not ledger_id:
+            raise ValueError("Choose a customer or supplier ledger for Outstanding Bills.")
+        return outstanding_bills(b, int(ledger_id), end)
     raise ValueError(f"Unknown report: {name}")

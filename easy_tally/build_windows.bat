@@ -4,7 +4,7 @@ REM Needs Python 3.9+ from python.org (includes Tkinter). Run from the easy_tall
 python -m pip install --upgrade pip || exit /b 1
 python -m pip install -r requirements.txt pyinstaller || exit /b 1
 python -m PyInstaller --noconfirm --clean --windowed --name EasyTally ^
-  --collect-all pdfplumber --collect-all pdfminer --collect-all pypdfium2 --add-data "easytally/web/static;easytally/web/static" run.py || exit /b 1
+  --collect-all pdfplumber --collect-all pdfminer --collect-all pypdfium2 --collect-all reportlab --collect-all openpyxl --add-data "easytally/web/static;easytally/web/static" run.py || exit /b 1
 echo.
 echo Built: dist\EasyTally\EasyTally.exe
 where iscc >nul 2>nul

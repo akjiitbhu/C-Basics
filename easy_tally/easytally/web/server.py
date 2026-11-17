@@ -4,6 +4,7 @@ import sys
 import threading
 import urllib.request
 import webbrowser
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -12,7 +13,7 @@ from .api import Api
 
 STATIC = Path(__file__).parent / "static"
 DEFAULT_PORT = 8765
-MAX_UPLOAD = 50 * 1024 * 1024      # 50 MB statement PDFs are plenty
+MAX_UPLOAD = 300 * 1024 * 1024     # statements are small; this allows large backups to be restored
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -27,7 +28,15 @@ class Handler(BaseHTTPRequestHandler):
     def _host_ok(self):
         return (self.headers.get("Host") or "") in self.allowed_hosts
 
-    def _send(self, status, payload, ctype="application/json; charset=utf-8", extra=None):
+    def _token(self):
+        c = SimpleCookie()
+        try:
+            c.load(self.headers.get("Cookie") or "")
+        except Exception:
+            return None
+        return c["et_session"].value if "et_session" in c else None
+
+    def _send(self, status, payload, ctype="application/json; charset=utf-8", extra=None, cookie=None):
         data = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", ctype)
@@ -36,6 +45,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
+        if cookie:
+            kind, token = cookie
+            if kind == "set":
+                self.send_header("Set-Cookie", f"et_session={token}; HttpOnly; SameSite=Strict; Path=/")
+            else:
+                self.send_header("Set-Cookie", "et_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
         self.end_headers()
         self.wfile.write(data)
 
@@ -66,15 +81,17 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 raw = data
             if url.path == "/api/shutdown":
+                if self.api.users.has_users() and not self.api.sessions.get(self._token()):
+                    return self._send(401, {"error": "Please sign in."})
                 self._send(200, {"ok": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
-        status, payload = self.api.handle(method, url.path, query, body, raw)
+        status, payload, cookie = self.api.handle(method, url.path, query, body, raw, self._token())
         if isinstance(payload, tuple):
-            ctype, data = payload
-            name = "report.csv" if url.path.endswith(".csv") else "download"
-            return self._send(status, data, ctype, {"Content-Disposition": f'attachment; filename="{name}"'})
-        self._send(status, payload)
+            ctype, data, filename = payload
+            disp = "inline" if ctype == "application/pdf" else "attachment"
+            return self._send(status, data, ctype, {"Content-Disposition": f'{disp}; filename="{filename}"'}, cookie)
+        self._send(status, payload, cookie=cookie)
 
     def do_GET(self):
         self._dispatch("GET")
