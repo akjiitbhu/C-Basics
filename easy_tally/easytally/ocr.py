@@ -114,10 +114,11 @@ def _prepare(img):
     if img.width * img.height > MAX_PIXELS:
         f = (MAX_PIXELS / (img.width * img.height)) ** 0.5
         img = img.resize((int(img.width * f), int(img.height * f)))
-    # A 3x3 median filter removes scanner speckle without touching text strokes. On simulated scans it lifted
-    # reading from 3-5 of 6 rows to 6 of 6 at every noise level tried (blurring or whitening the background
-    # made it worse).
-    img = img.filter(ImageFilter.MedianFilter(3))
+    # Scanner speckle (and JPEG blocks around it) wrecks OCR. Two passes of a 3x3 median filter remove it without
+    # eroding text strokes. Measured on speckled JPEG-in-PDF scans with rapidocr 1.4.4 (30 amounts to find):
+    # no filter ~10, one pass 26, two passes 30. A 5x5 median (17), bilateral (21), Otsu (25) and adaptive
+    # thresholding (16) were all worse.
+    img = img.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.MedianFilter(3))
     return ImageOps.autocontrast(img, cutoff=1)
 
 
@@ -130,6 +131,32 @@ def _jpeg(img) -> bytes:
     return buf.getvalue()
 
 
+def _render_scale(page) -> float:
+    """Pixels per PDF point for rendering a page for OCR.
+
+    A scanned page is one big image. Rendering it at its own native resolution keeps every pixel as it was
+    scanned; rendering at some other resolution resamples it, which smears single-pixel scanner speckle into
+    blobs that the denoiser can no longer remove (this cost most of the accuracy on a newer OCR version).
+    Ordinary PDFs (no full-page image) are rendered at OCR_DPI.
+    """
+    default = OCR_DPI / 72
+    try:
+        import pypdfium2.raw as pdfium_c
+        pw, ph = page.get_size()
+        best = 0.0
+        for obj in page.get_objects(filter=(pdfium_c.FPDF_PAGEOBJ_IMAGE,)):
+            left, bottom, right, top = obj.get_bounds()
+            if (right - left) * (top - bottom) < 0.7 * pw * ph:
+                continue                                              # a logo or stamp, not the scan itself
+            w, h = obj.get_px_size()
+            best = max(best, max(w, h) / max(right - left, top - bottom, 1))   # orientation-proof
+        if best:
+            return min(max(best, 150 / 72), 400 / 72)
+    except Exception:
+        pass
+    return default
+
+
 def load_images(data: bytes) -> list:
     """PDF (every page rendered) or a JPEG/PNG photo -> [PIL grayscale images]."""
     from PIL import Image
@@ -138,7 +165,7 @@ def load_images(data: bytes) -> list:
         pdf = pdfium.PdfDocument(data)
         if len(pdf) > MAX_PAGES:
             raise OcrUnavailable(f"The PDF has {len(pdf)} pages; scanned statements are limited to {MAX_PAGES} pages.")
-        return [_prepare(pdf[i].render(scale=OCR_DPI / 72).to_pil()) for i in range(len(pdf))]
+        return [_prepare(pdf[i].render(scale=_render_scale(pdf[i])).to_pil()) for i in range(len(pdf))]
     try:
         return [_prepare(Image.open(io.BytesIO(data)))]
     except Exception:
