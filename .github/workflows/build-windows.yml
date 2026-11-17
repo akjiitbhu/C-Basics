@@ -59,8 +59,9 @@ jobs:
           if ([System.Text.Encoding]::ASCII.GetString($pdf[0..3]) -ne "%PDF") { throw "invoice PDF not generated" }
           $xl = Get-Bytes "/api/gst/gstr1.xlsx?month=2026-04"
           if ([System.Text.Encoding]::ASCII.GetString($xl[0..1]) -ne "PK") { throw "GSTR-1 Excel not generated" }
-          $tm = Get-Bytes "/api/tally/masters.xml"
-          if ([System.Text.Encoding]::UTF8.GetString($tm) -notmatch "<LEDGER ") { throw "Tally XML not generated" }
+          # PowerShell hands back XML as text (not bytes), so check it as a string
+          $tm = (Invoke-WebRequest "$base/api/tally/masters.xml" -WebSession $s -UseBasicParsing).Content
+          if ("$tm" -notmatch "<LEDGER ") { throw "Tally XML not generated" }
           $bk = Get-Bytes "/api/backup"
           if ([System.Text.Encoding]::ASCII.GetString($bk[0..1]) -ne "PK") { throw "backup not generated" }
           Call-Api "/api/shutdown" @{} | Out-Null
