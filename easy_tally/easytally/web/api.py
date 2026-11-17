@@ -13,7 +13,7 @@ from calendar import monthrange
 
 from .. import auth, backup, db, gst_returns, reports, tally_xml
 from ..accounting import INVOICE_KINDS, Books, CashLimitError, display_date, parse_date
-from ..bank_import import StatementError, check_consistency, parse_statement
+from ..bank_import import StatementError, check_consistency, parse_statement_ex
 from ..gst import GST_RATES, STATES
 from ..invoice_pdf import invoice_pdf
 from ..accounting import VOUCHER_TYPES
@@ -60,43 +60,66 @@ class Api:
     def username(self):
         return self.ctx.user["username"] if self.ctx.user else ""
 
+    def _authenticate(self, token, perm):
+        """Resolve the signed-in user and check the route's permission. Sets self.ctx. Call with the lock held."""
+        user = None
+        name = self.sessions.get(token)
+        if name:
+            user = self.users.get(name)
+            if not user or user["disabled"]:
+                self.sessions.destroy(token)
+                user = None
+        ctx = self.ctx = Ctx(user)
+        ctx.token = token
+        if perm is not None:
+            if not self.users.has_users():
+                raise ApiError("Create the first administrator account to begin.", 401, setup=True)
+            if not user:
+                raise ApiError("Please sign in.", 401)
+            if perm != "auth" and perm not in auth.ROLE_PERMS[user["role"]]:
+                raise ApiError("Your role does not allow this action.", 403)
+        return user
+
     def handle(self, method, path, query, body=None, raw=None, token=None):
-        """Returns (status, payload, cookie). payload is JSON-able or (content_type, bytes, filename)."""
+        """Returns (status, payload, cookie). payload is JSON-able or (content_type, bytes, filename).
+
+        A route may have a third element, a `prep` function for slow work that needs no database (reading a
+        scanned statement with OCR). It runs after the permission check but OUTSIDE the lock, so one long
+        scan never freezes every other request; its result is passed to the route as a fourth argument.
+        """
         route = ROUTES.get((method, path))
         if not route:
             return 404, {"error": "Not found"}, None
-        func, perm = route
-        with self.lock:
-            user = None
-            name = self.sessions.get(token)
-            if name:
-                user = self.users.get(name)
-                if not user or user["disabled"]:
-                    self.sessions.destroy(token)
-                    user = None
-            ctx = self.ctx = Ctx(user)
-            ctx.token = token
+        func, perm = route[0], route[1]
+        prep = route[2] if len(route) > 2 else None
+        prepared = None
+        if prep is not None:
             try:
-                if perm is not None:
-                    if not self.users.has_users():
-                        raise ApiError("Create the first administrator account to begin.", 401, setup=True)
-                    if not user:
-                        raise ApiError("Please sign in.", 401)
-                    if perm != "auth" and perm not in auth.ROLE_PERMS[user["role"]]:
-                        raise ApiError("Your role does not allow this action.", 403)
-                result = func(self, query, body or {}, raw)
+                with self.lock:
+                    self._authenticate(token, perm)
+                prepared = prep(self, query, body or {}, raw)
+            except ApiError as e:
+                return e.status, {"error": str(e), **e.extra}, None
+            except (ValueError, auth.AuthError) as e:
+                return 400, {"error": str(e)}, None
+        with self.lock:
+            ctx = None
+            try:
+                user = self._authenticate(token, perm)
+                ctx = self.ctx
+                result = func(self, query, body or {}, raw) if prep is None else func(self, query, body or {}, raw, prepared)
                 if method == "POST" and path in AUDITED and self.books and user:   # changes only, never plain views
                     info = body if body else query
                     self.books.audit(self.username, AUDITED[path], json.dumps(info, default=str)[:400] if info else "")
                 return 200, result, ctx.cookie
             except ApiError as e:
-                return e.status, {"error": str(e), **e.extra}, ctx.cookie
+                return e.status, {"error": str(e), **e.extra}, ctx.cookie if ctx else None
             except CashLimitError as e:
                 # Not blocked: 409 so the page can ask "post anyway?". Blocked by the company's setting: 400.
                 return (400 if e.blocked else 409), {"error": str(e), "cash_warning": e.warnings,
                                                      "blocked": e.blocked}, ctx.cookie
             except (ValueError, auth.AuthError) as e:     # validation errors raised by the engine
-                return 400, {"error": str(e)}, ctx.cookie
+                return 400, {"error": str(e)}, ctx.cookie if ctx else None
 
     # ---- authentication ------------------------------------------------------
     def auth_status(self, q, body, raw):
@@ -326,32 +349,115 @@ class Api:
     def bank_accounts(self, q, body, raw):
         return [{"id": l["id"], "name": l["name"]} for l in self._b().ledgers("Bank Accounts")]
 
+    @staticmethod
+    def _plain(paise):
+        """Paise -> '12500.00' for input boxes ('' when unknown)."""
+        return "" if paise is None else f"{paise / 100:.2f}"
+
     def bank_txns(self, q, body, raw):
         b = self._b()
-        rows = b.bank_txns(_int(q.get("bank_id"), "bank account"), pending_only=q.get("posted") != "1")
-        return [{"id": t["id"], "date": display_date(t["date"]), "narration": t["narration"],
+        rows = b.bank_txns(_int(q.get("bank_id"), "bank account"), pending_only=q.get("posted") != "1",
+                           import_id=_int(q["import_id"]) if q.get("import_id") else None)
+        return [{"id": t["id"], "import_id": t["import_id"], "date": display_date(t["date"]), "date_iso": t["date"],
+                 "narration": t["narration"],
                  "debit": fmt(t["debit"]) if t["debit"] else "", "credit": fmt(t["credit"]) if t["credit"] else "",
+                 "debit_val": self._plain(t["debit"] or None), "credit_val": self._plain(t["credit"] or None),
+                 "balance_val": self._plain(t["balance"]),
                  "ledger_id": t["counter_ledger_id"], "posted": bool(t["voucher_id"]),
-                 "uncertain": bool(t["uncertain"])} for t in rows]
+                 "uncertain": bool(t["uncertain"]), "verified": bool(t["verified"]), "source": t["source"],
+                 "confidence": t["confidence"], "page": t["page"], "y0": t["y0"], "y1": t["y1"], "note": t["note"]}
+                for t in rows]
 
-    def bank_import(self, q, body, raw):
+    def ocr_status(self, q, body, raw):
+        from .. import ocr
+        return ocr.engine_status()
+
+    def _import_prep(self, q, body, raw):
+        """Slow part of a statement import (text parsing or OCR). Needs no database, so it runs unlocked."""
+        _int(q.get("bank_id"), "bank account")
+        if not raw:
+            raise ApiError("No file received.")
+        mode = q.get("ocr") or "auto"
+        if mode not in ("auto", "force", "off"):
+            raise ApiError("ocr must be auto, force or off")
+        try:
+            return parse_statement_ex(raw, ocr=mode)
+        except StatementError as e:
+            raise ApiError(str(e))
+
+    def bank_import(self, q, body, raw, parsed):
         b = self._b()
         bank_id = _int(q.get("bank_id"), "bank account")
         if not b.get_ledger(bank_id):
             raise ApiError("Unknown bank account")
-        if not raw or not raw.startswith(b"%PDF"):
-            raise ApiError("That file is not a PDF.")
-        fd, tmp = tempfile.mkstemp(suffix=".pdf")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(raw)
-            txns = parse_statement(tmp)
-        except StatementError as e:
-            raise ApiError(str(e))
-        finally:
-            os.unlink(tmp)
-        new, dup = b.stage_bank_transactions(bank_id, q.get("filename") or "statement.pdf", txns)
-        return {"new": new, "duplicates": dup, "warnings": check_consistency(txns)[:10]}
+        new, dup = b.stage_bank_transactions(bank_id, q.get("filename") or "statement.pdf", parsed.txns,
+                                             pages=parsed.pages, engine=parsed.engine, opening=parsed.opening)
+        imp = b.bank_imports(bank_id)[0] if new else None
+        warnings = (parsed.warnings if parsed.source == "ocr" else check_consistency(parsed.txns))[:12]
+        return {"new": new, "duplicates": dup, "warnings": warnings, "ocr": parsed.source == "ocr",
+                "engine": parsed.engine, "import_id": imp["id"] if imp else None,
+                "needs_review": (imp["unverified"] or 0) if imp else 0}
+
+    def bank_imports(self, q, body, raw):
+        b = self._b()
+        out = []
+        for i in b.bank_imports(_int(q.get("bank_id"), "bank account")):
+            out.append({"id": i["id"], "filename": i["filename"], "source": i["source"], "pages": i["pages"],
+                        "engine": i["engine"], "imported_at": i["imported_at"], "rows": i["rows"],
+                        "unverified": i["unverified"] or 0, "posted": i["posted"] or 0,
+                        "opening": self._plain(i["opening_balance"]), "closing": self._plain(i["closing_balance"])})
+        return out
+
+    def bank_page(self, q, body, raw):
+        got = self._b().bank_page(_int(q.get("import_id")), _int(q.get("page") or 1))
+        if not got:
+            raise ApiError("No page image for this statement", 404)
+        return (got[0], got[1], f"statement-page-{q.get('page') or 1}.jpg")
+
+    def bank_update_txn(self, q, body, raw):
+        self._b().update_bank_txn(_int(body.get("id")), body.get("date", ""), body.get("narration", ""),
+                                  body.get("debit", ""), body.get("credit", ""), body.get("balance", ""),
+                                  verify=body.get("verify", True))
+        return {"ok": True}
+
+    def bank_add_txn(self, q, body, raw):
+        after = body.get("after_id")
+        i = self._b().add_bank_txn(_int(body.get("import_id")), _int(after) if after else None, body.get("date", ""),
+                                   body.get("narration", ""), body.get("debit", ""), body.get("credit", ""),
+                                   body.get("balance", ""), verify=body.get("verify", True))
+        return {"id": i}
+
+    def bank_delete_txn(self, q, body, raw):
+        self._b().delete_bank_txns([_int(i) for i in body.get("ids", [])])
+        return {"ok": True}
+
+    def bank_verify(self, q, body, raw):
+        self._b().verify_bank_txns([_int(i) for i in body.get("ids", [])], bool(body.get("verified", True)))
+        return {"ok": True}
+
+    def bank_verify_reconciled(self, q, body, raw):
+        return {"verified": self._b().verify_reconciled(_int(body.get("import_id")))}
+
+    def bank_balances(self, q, body, raw):
+        self._b().set_import_balances(_int(body.get("import_id")), body.get("opening"), body.get("closing"))
+        return {"ok": True}
+
+    def bank_reconcile(self, q, body, raw):
+        r = self._b().reconcile(_int(q.get("import_id")))
+        money = lambda p: None if p is None else f"{p / 100:.2f}"
+        rows = []
+        for x in r["rows"]:
+            item = {"id": x["id"], "ok": x["ok"]}
+            if x["ok"] is False:
+                item["expected"] = money(x["expected"])
+                for k in ("fix_amount", "missing_row"):
+                    item[k] = {"side": x[k]["side"], "amount": money(x[k]["amount"])} if x[k] else None
+            rows.append(item)
+        return {"rows": rows, "ok": r["ok"], "bad": r["bad"], "unchecked": r["unchecked"],
+                "debit_total": money(r["debit_total"]), "credit_total": money(r["credit_total"]),
+                "opening": money(r["opening"]), "opening_inferred": r["opening_inferred"],
+                "closing_computed": money(r["closing_computed"]), "closing_stated": money(r["closing_stated"]),
+                "closing_diff": money(r["closing_diff"])}
 
     def bank_set_ledger(self, q, body, raw):
         b = self._b()
@@ -366,8 +472,12 @@ class Api:
             ids = [t["id"] for t in b.bank_txns(_int(body["all_for_bank"]), pending_only=True)]
         else:
             ids = [_int(i) for i in body.get("ids", [])]
+        marks = ",".join("?" * len(ids))
+        unverified = b.conn.execute(
+            f"SELECT COUNT(*) FROM bank_txns WHERE verified = 0 AND voucher_id IS NULL AND id IN ({marks})",
+            ids).fetchone()[0] if ids else 0
         posted, skipped = b.post_bank_transactions(ids, use_suspense=bool(body.get("suspense")))
-        return {"posted": posted, "skipped": skipped}
+        return {"posted": posted, "skipped": skipped, "unverified": unverified}
 
     # ---- reports -----------------------------------------------------------
     def _report(self, q):
@@ -486,7 +596,14 @@ ROUTES = {
     ("POST", "/api/invoices/update"): (Api.invoice_update, "write"),
     ("POST", "/api/invoices/preview"): (Api.invoice_preview, "read"), ("GET", "/api/invoice.pdf"): (Api.invoice_pdf, "read"),
     ("GET", "/api/bank/accounts"): (Api.bank_accounts, "read"), ("GET", "/api/bank/txns"): (Api.bank_txns, "read"),
-    ("POST", "/api/bank/import"): (Api.bank_import, "write"), ("POST", "/api/bank/set_ledger"): (Api.bank_set_ledger, "write"),
+    ("POST", "/api/bank/import"): (Api.bank_import, "write", Api._import_prep),
+    ("POST", "/api/bank/set_ledger"): (Api.bank_set_ledger, "write"),
+    ("GET", "/api/ocr/status"): (Api.ocr_status, "read"), ("GET", "/api/bank/imports"): (Api.bank_imports, "read"),
+    ("GET", "/api/bank/page"): (Api.bank_page, "read"), ("GET", "/api/bank/reconcile"): (Api.bank_reconcile, "read"),
+    ("POST", "/api/bank/update_txn"): (Api.bank_update_txn, "write"), ("POST", "/api/bank/add_txn"): (Api.bank_add_txn, "write"),
+    ("POST", "/api/bank/delete_txn"): (Api.bank_delete_txn, "write"), ("POST", "/api/bank/verify"): (Api.bank_verify, "write"),
+    ("POST", "/api/bank/verify_reconciled"): (Api.bank_verify_reconciled, "write"),
+    ("POST", "/api/bank/balances"): (Api.bank_balances, "write"),
     ("POST", "/api/bank/post"): (Api.bank_post, "write"),
     ("GET", "/api/report"): (Api.report, "read"), ("GET", "/api/report.csv"): (Api.report_csv, "read"),
     ("GET", "/api/gst/check"): (Api.gst_check, "read"),
@@ -504,5 +621,8 @@ AUDITED = {
     "/api/items/delete": "Stock item deleted", "/api/vouchers": "Voucher added", "/api/vouchers/update": "Voucher edited",
     "/api/vouchers/delete": "Voucher deleted", "/api/invoices": "Invoice added", "/api/invoices/update": "Invoice edited",
     "/api/bank/import": "Bank statement imported", "/api/bank/post": "Bank rows posted",
+    "/api/bank/update_txn": "Bank row corrected", "/api/bank/add_txn": "Bank row added by hand",
+    "/api/bank/delete_txn": "Bank rows deleted", "/api/bank/verify": "Bank rows verified",
+    "/api/bank/verify_reconciled": "Bank rows verified (balances add up)", "/api/bank/balances": "Statement balances set",
     "/api/tally/import": "Tally XML imported", "/api/settings": "Company details changed",
 }

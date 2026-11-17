@@ -89,7 +89,7 @@ class Handler(BaseHTTPRequestHandler):
         status, payload, cookie = self.api.handle(method, url.path, query, body, raw, self._token())
         if isinstance(payload, tuple):
             ctype, data, filename = payload
-            disp = "inline" if ctype == "application/pdf" else "attachment"
+            disp = "inline" if ctype in ("application/pdf", "image/jpeg") else "attachment"
             return self._send(status, data, ctype, {"Content-Disposition": f'{disp}; filename="{filename}"'}, cookie)
         self._send(status, payload, cookie=cookie)
 

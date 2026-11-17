@@ -10,7 +10,7 @@ Two strategies, tried in order:
 Scanned (image-only) PDFs are detected and rejected with a clear message.
 """
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
 from .accounting import parse_date
@@ -26,6 +26,13 @@ class Txn:
     balance: int = None  # paise (signed; overdraft negative) or None
     ref: str = ""
     uncertain: bool = False   # direction had to be guessed
+    # --- filled in only for rows read by OCR (see ocr.py) ---
+    page: int = 0             # 1-based page of the scan
+    y0: float = 0.0           # vertical band of the row on that page, 0..1 from the top
+    y1: float = 0.0
+    confidence: float = 1.0   # lowest OCR confidence among the date and amounts
+    source: str = "pdf"       # 'pdf' (text layer), 'ocr' or 'manual'
+    note: str = ""            # why the row needs attention
 
 
 class StatementError(Exception):
@@ -240,28 +247,81 @@ def check_consistency(txns):
     return warnings
 
 
-def parse_statement(path):
-    """Parse a bank statement PDF into [Txn]. Raises StatementError with a friendly message."""
+@dataclass
+class ParseResult:
+    txns: list
+    source: str = "pdf"                  # 'pdf' or 'ocr'
+    pages: list = field(default_factory=list)      # JPEG bytes per page (OCR only), for the review screen
+    engine: str = ""
+    warnings: list = field(default_factory=list)
+    opening: int = None                  # printed opening balance (paise), when the scan shows one
+
+
+NO_TEXT_MESSAGE = ("This PDF has no selectable text (it looks scanned). Download the statement directly from net "
+                   "banking, or turn on OCR to read the scan.")
+
+
+def _is_image(data: bytes) -> bool:
+    return data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def parse_statement_ex(data, ocr: str = "auto") -> ParseResult:
+    """Parse a statement given as bytes (or a path): text PDF, scanned PDF or a JPEG/PNG photo.
+
+    ocr: 'auto' reads a scan with OCR when the file has no text layer; 'force' always uses OCR;
+    'off' never does. Raises StatementError with a friendly message.
+    """
+    import io
+    if not isinstance(data, (bytes, bytearray)):
+        with open(str(data), "rb") as fh:
+            data = fh.read()
+    data = bytes(data)
+    is_pdf = data[:4] == b"%PDF"
+    if not is_pdf and not _is_image(data):
+        raise StatementError("That file is not a PDF or a JPEG/PNG image.")
+
+    if is_pdf and ocr != "force":
+        try:
+            import pdfplumber
+        except ImportError:
+            raise StatementError("The 'pdfplumber' package is required: pip install pdfplumber")
+        try:
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                if not pdf.pages:
+                    raise StatementError("The PDF has no pages.")
+                if any((p.extract_text() or "").strip() for p in pdf.pages):
+                    txns = _parse_tables(pdf) or _parse_text(pdf)
+                    if not txns:
+                        raise StatementError("No transactions were recognised. The statement layout may not be "
+                                             "supported yet - please share a sample so a parser can be added.")
+                    return ParseResult(txns)
+        except StatementError:
+            raise
+        except Exception as e:  # password-protected, corrupt, etc.
+            raise StatementError(f"Could not read the PDF: {e}")
+        if ocr == "off":
+            raise StatementError(NO_TEXT_MESSAGE)
+
+    # ---- scanned PDF, photo, or OCR forced
+    from . import ocr as ocr_mod
+    status = ocr_mod.engine_status()
+    if not status["available"]:
+        raise StatementError((NO_TEXT_MESSAGE if is_pdf else "Photos need OCR.") + " " + status["detail"])
     try:
-        import pdfplumber
-    except ImportError:
-        raise StatementError("The 'pdfplumber' package is required: pip install pdfplumber")
-    try:
-        with pdfplumber.open(str(path)) as pdf:
-            if not pdf.pages:
-                raise StatementError("The PDF has no pages.")
-            if not any((p.extract_text() or "").strip() for p in pdf.pages):
-                raise StatementError("This PDF has no selectable text (it looks scanned). "
-                                     "Download the statement PDF directly from net banking, "
-                                     "or run OCR on it first.")
-            txns = _parse_tables(pdf)
-            if not txns:
-                txns = _parse_text(pdf)
-    except StatementError:
-        raise
-    except Exception as e:  # password-protected, corrupt, etc.
-        raise StatementError(f"Could not read the PDF: {e}")
+        pages = ocr_mod.scan_document(data)
+    except ocr_mod.OcrUnavailable as e:
+        raise StatementError(str(e))
+    except Exception as e:
+        raise StatementError(f"Could not read the scan: {e}")
+    info = {}
+    txns = ocr_mod.parse_ocr_pages(pages, info)
     if not txns:
-        raise StatementError("No transactions were recognised. The statement layout may not be "
-                             "supported yet - please share a sample so a parser can be added.")
-    return txns
+        raise StatementError("The scan was read but no transactions were recognised. Try a sharper scan (at least "
+                             "200 dpi, straight on, good light), or enter the rows by hand.")
+    warnings = [f"Row {i} ({t.date}): {t.note}" for i, t in enumerate(txns, 1) if t.note]
+    return ParseResult(txns, "ocr", [p.image for p in pages], status["engine"], warnings, info.get("opening"))
+
+
+def parse_statement(path):
+    """Parse a text-based bank statement PDF into [Txn] (no OCR). Raises StatementError with a friendly message."""
+    return parse_statement_ex(path, ocr="off").txns

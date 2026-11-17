@@ -7,7 +7,7 @@ accountant or consultant who serves **many customers**, with **bank statement PD
 
 ```bash
 cd easy_tally
-pip install -r requirements.txt     # pdfplumber, reportlab, openpyxl
+pip install -r requirements.txt     # pdfplumber, reportlab, openpyxl, rapidocr-onnxruntime (OCR)
 python run.py                        # needs Python 3.9+ with Tkinter
 ```
 Linux: if `import tkinter` fails, install it (`sudo apt install python3-tk`).
@@ -44,7 +44,7 @@ To build it yourself on Windows: run `build_windows.bat` in this folder.
 | Vouchers | Payment, Receipt, Journal, Contra. Debits must equal credits. **Vouchers can be edited** in place (type and number are kept). |
 | GST documents | Sales and purchase invoices, **credit notes** (sales returns) and **debit notes** (purchase returns). CGST+SGST or IGST by state; stock follows. Invoices and notes can be edited. |
 | **PDF invoices** | One-click printable tax invoice / credit note / debit note with company details, HSN, tax split, amount in words (Indian system), bank details and terms. |
-| **Bank statement import** | Pick PDFs, review, map to ledgers, post as vouchers (details below). |
+| **Bank statement import** | Pick PDFs, review, map to ledgers, post as vouchers (details below). **Scanned PDFs and photos** are read with offline OCR, then every row is verified by hand against the page before it can be posted. |
 | **Cash limit checks** | Cash payments above the limit (default ₹10,000, Sec 40A(3)) and cash receipts above the limit (default ₹1,99,999.99, i.e. ₹2 lakh or more, Sec 269ST) are shown in **red** while you type, in the voucher list, Day Book and Ledger, and in the *Cash Limit Exceptions* report. Same-day cash with one person is added up. On save you are asked to confirm (or the entry is blocked, your choice in Admin > Company details). Overrides are in the audit trail. Moves between your own cash and bank accounts are not checked. |
 | **Receivables and payables** | Ageing (0-30 / 31-60 / 61-90 / over 90 days) and bill-wise outstanding per customer or supplier, with receipts, payments and notes settled oldest-first (FIFO). |
 | **GST returns** | **GSTR-1** (B2B, B2C large and small, credit notes, HSN summary, document series) and **GSTR-3B** summary as JSON in the GST offline-tool layout, plus Excel working papers and a list of warnings (missing HSN, bad GSTIN, long invoice numbers...). |
@@ -70,9 +70,41 @@ To build it yourself on Windows: run `build_windows.bat` in this folder.
    `Suspense A/c` so the bank ledger still matches the statement). Deleting a voucher returns
    its bank row to Pending.
 
-Scanned or photographed statements are detected and rejected with a clear message (OCR is not
-included). Every bank formats statements differently, so if a bank is not recognised, add a
-sample to `tests/` and extend `_locate_columns` or the text parser.
+Every bank formats statements differently, so if a bank is not recognised, add a sample to
+`tests/` and extend `_locate_columns` or the text parser.
+
+## Scanned statements and photos (OCR) with manual verification
+
+Browser version. PDFs with no text layer (scans) and JPG/PNG photos are read with **OCR**
+(RapidOCR; the models are inside the installer, so it runs offline and nothing leaves the PC).
+OCR is never trusted blindly:
+
+1. **Read.** Each page is rendered at 250 dpi, straightened (de-skewed up to 3 degrees) and OCR'd.
+   Rows are rebuilt from word positions. If the table has Debit / Credit / Balance headings, the
+   column an amount sits under decides debit or credit; otherwise the running balance does. Known
+   OCR damage is repaired (dates like `05/0.4/2025`, `;` read for `,`, fused numbers like
+   `412.001,52,894.30`).
+2. **Everything starts unverified.** Each row keeps its OCR confidence, the straightened page
+   image and its position on it. **Unverified rows cannot be posted**: the server refuses them,
+   whatever the screen shows.
+3. **Verify against the page.** *Bank Statements > Verify* shows the scanned page across the top
+   (the selected row is highlighted; the page stays in view while you scroll) and an editable row
+   list below. Correct anything misread and press **Save ✓**, which verifies that row.
+4. **The arithmetic helps you.** Each row is checked: previous balance + credit - debit must equal
+   its balance. A row that fails is shown in red with one-click fixes ("Amount is 5,000.00",
+   "Balance is 1,57,500.00") and, if OCR missed a whole line, "A debit of 5,000.00 is missing
+   above", which inserts a row in the right place for you to fill in. Type the statement's opening
+   and closing balances to check the total as well.
+5. **Bulk actions, on purpose explicit.** *Verify all rows that add up* only marks rows whose balance
+   checks out; *Verify all remaining* asks you to confirm that you compared every row.
+6. Post as usual. Verifications, corrections, inserted rows and posting are on the audit trail.
+
+Honest limits: OCR can misread digits (`5` for `S`, `1` for `I`) and can **miss whole lines**, which is
+why the balance check and the page image matter. Use a sharp, straight-on scan (200 dpi or better).
+Phone photos work best flat and evenly lit; curved or angled pages (perspective) are not corrected.
+Handwriting, password-protected PDFs and statements over 60 pages are not supported. A scan takes
+about 2-5 seconds per page; other screens keep working meanwhile. The desktop window does not read
+scans; it tells you to use the browser version.
 
 ## Accounting notes
 
@@ -129,6 +161,7 @@ easytally/
   db.py           schema, default groups/ledgers, company files
   accounting.py   Books: masters, vouchers, GST invoices, bank staging/posting
   bank_import.py  PDF statement parser and consistency checks
+  ocr.py          OCR for scans/photos: render, deskew, read, rebuild rows
   gst.py          GST rates, state codes, CGST/SGST/IGST maths
   gst_returns.py  GSTR-1 / GSTR-3B JSON and Excel
   invoice_pdf.py  printable invoices, amount in words

@@ -36,7 +36,19 @@ tr.muted td{color:var(--muted)}tr.warn td{background:var(--warn)}tr.bold td{font
 #toast.bad{background:var(--bad)}
 .picker{max-width:560px;margin:50px auto}.picker li{list-style:none}
 .co-btn{display:block;width:100%;text-align:left;margin:6px 0;padding:11px 14px}
-.muted{color:var(--muted)}.bad{color:var(--bad)}.red{color:var(--bad)!important;font-weight:700}.ok{color:var(--good)}ul.w{margin:6px 0 0 18px;padding:0}ul.w li{margin:3px 0}textarea{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--ink);font:inherit;min-height:60px}.tot{font-weight:600}
+.muted{color:var(--muted)}.bad{color:var(--bad)}.red{color:var(--bad)!important;font-weight:700}
+.rv-grid{display:block}
+.rv-grid>div{min-width:0}
+.rv-img{position:sticky;top:0;z-index:6;max-height:38vh;overflow:auto;border:1px solid var(--line);border-radius:8px;background:#fff;margin:0 0 10px;box-shadow:0 4px 12px rgba(0,0,0,.12)}
+.rv-img img{width:100%;display:block}
+.hl{position:absolute;left:0;right:0;display:none;background:rgba(255,190,0,.28);border-top:2px solid #f0a000;border-bottom:2px solid #f0a000;pointer-events:none}
+.rvt input,.rvt select{padding:4px 6px;font-size:13px}
+.rvt tr.sel td{background:rgba(31,111,235,.12)}
+.rvt tr.bad-row td{background:rgba(198,40,40,.10)}
+.rvt tr.dirty td:first-child{box-shadow:inset 3px 0 0 #f0a000}
+.rvt td.chk{white-space:normal;min-width:200px;font-size:12px}
+.rvt td.chk .b{padding:2px 8px;margin:2px 0;font-size:12px}
+@media(max-width:900px){.rv-img{max-height:30vh}}.ok{color:var(--good)}ul.w{margin:6px 0 0 18px;padding:0}ul.w li{margin:3px 0}textarea{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--ink);font:inherit;min-height:60px}.tot{font-weight:600}
 .drop{border:2px dashed var(--line);border-radius:10px;padding:18px;text-align:center;color:var(--muted)}
 .drop.over{border-color:var(--brand);background:var(--bg)}
 </style>
@@ -122,7 +134,7 @@ async function picker(){
    <div class="row"><input type="file" id="rf" accept=".zip,.db" style="width:auto"><button class="b" onclick="restoreFile('rf')">Restore</button></div>`:""}</div>`;
 }
 // Anything half-finished belongs to one company: never carry it into another one.
-function resetState(){VL=[];IL=[];VEDIT=null;IEDIT=null;BANK="";RQ.ledger="";RL=[]}
+function resetState(){VL=[];IL=[];VEDIT=null;IEDIT=null;BANK="";RV=null;RQ.ledger="";RL=[]}
 const openCo=guard(async s=>{await api("/api/company/open",{slug:s});resetState();await start()});
 const newCo=guard(async()=>{await api("/api/company/create",{name:$("#cn").value,state:$("#cs").value,gstin:$("#cg").value});resetState();await start()});
 const switchCompany=guard(async()=>{await api("/api/company/close",{});resetState();await start()});
@@ -277,49 +289,69 @@ const iSave=guard(async()=>{
 const iDel=guard(async id=>{if(confirm("Delete this document?")){await api("/api/vouchers/delete",{ids:[id]});if(IEDIT===id){IEDIT=null;IL=[]}invoices()}});
 
 /* ---------- bank statements ---------- */
-let BANK="", ALL=[];
+let BANK="", ALL=[], RV=null;   // RV: the scanned statement open in the review screen
+const pct=c=>Math.round(c*100)+"%";
 async function bank(){
-  const [B,L]=await Promise.all([api("/api/bank/accounts"),api("/api/ledgers")]);ALL=L;
+  const [B,L,O]=await Promise.all([api("/api/bank/accounts"),api("/api/ledgers"),api("/api/ocr/status")]);ALL=L;
   if(!B.find(b=>String(b.id)===String(BANK)))BANK=B[0]?B[0].id:"";
   const W=can("write");
-  $("#main").innerHTML=`<div class="card"><h3>Bank statements</h3>
-   <div class="grid"><div><label>Bank account</label><select id="bk" onchange="BANK=this.value;bankRows()">${opts(B,"id","name",BANK)}</select></div>
+  $("#main").innerHTML=`<div id="review"></div><div class="card"><h3>Bank statements</h3>
+   <div class="grid"><div><label>Bank account</label><select id="bk" onchange="BANK=this.value;RV=null;bank()">${opts(B,"id","name",BANK)}</select></div>
    ${W?`<div><label>New bank account name</label><input id="bn" placeholder="e.g. HDFC Current A/c"></div>
    <div><label>Opening balance</label><input id="bo" value="0"></div>
    <div><label>Dr / Cr</label><select id="bs"><option>Dr</option><option>Cr</option></select></div>
    <div><button class="b" onclick="newBank()">Add bank account</button></div>`:""}</div>
-   ${W?`<div class="drop" id="drop" style="margin-top:12px">Drop statement PDF(s) here, or <label style="display:inline;color:var(--brand);cursor:pointer;font-size:inherit">choose files<input type="file" id="bf" accept="application/pdf" multiple hidden></label>
-   <div class="muted">Text-based PDFs downloaded from net banking. Re-importing the same statement is safe.</div></div>`:""}<div id="bres"></div></div>
+   ${W?`<div class="grid" style="margin-top:12px"><div><label>Scanned PDF or photo?</label><select id="ocrmode"><option value="auto">Read with OCR if the file is a scan</option><option value="force">Always use OCR</option><option value="off">Never use OCR</option></select></div></div>
+   <div class="drop" id="drop" style="margin-top:8px">Drop statement PDF(s) or photos (JPG/PNG) here, or <label style="display:inline;color:var(--brand);cursor:pointer;font-size:inherit">choose files<input type="file" id="bf" accept="application/pdf,image/jpeg,image/png" multiple hidden></label>
+   <div class="muted">Re-importing the same statement is safe.</div></div>
+   ${O.available?`<div class="muted" style="margin-top:6px">Scans and photos are read with OCR (${esc(O.engine)}) on this computer. You then check every row against the page: OCR can misread digits.</div>`
+     :`<div class="msg" style="background:var(--warn);margin-top:8px">Scanned statements and photos cannot be read on this computer: ${esc(O.detail)}</div>`}`:""}<div id="bres"></div></div>
+   <div class="card" id="bimps" style="display:none"></div>
    <div class="card"><div class="row" style="margin:0 0 8px"><h3 style="margin:0">Transactions</h3><span class="sp" style="flex:1"></span>
     <label style="display:inline;margin:0"><input type="checkbox" id="bp" onchange="bankRows()" style="width:auto"> show posted</label>
     <label style="display:inline;margin:0" title="When you pick a ledger, also remember it for similar narrations"><input type="checkbox" id="bl" style="width:auto"> remember choice</label></div>
-   <div id="brows"></div>
+   <div id="bunver"></div><div id="brows"></div>
    ${W?`<div class="row"><button class="b p" onclick="bankPost('sel')">Post selected</button><button class="b" onclick="bankPost('mapped')">Post all with ledger</button>
     <button class="b" onclick="bankPost('susp')">Post all (rest to Suspense)</button><span id="bsum" class="muted"></span></div>`:""}</div>`;
   if(W){const drop=$("#drop"),f=$("#bf");
     f.onchange=()=>{const fs=[...f.files];f.value="";upload(fs)};   // reset so the same file can be chosen again
     drop.ondragover=e=>{e.preventDefault();drop.classList.add("over")};drop.ondragleave=()=>drop.classList.remove("over");
     drop.ondrop=e=>{e.preventDefault();drop.classList.remove("over");upload(e.dataTransfer.files)}}
-  bankRows();
+  bankRows();bankImports();
+  if(RV&&String(RV.bank)===String(BANK))reviewOpen(RV.imp,true);else RV=null;
 }
 const newBank=guard(async()=>{await api("/api/ledgers",{name:$("#bn").value,group:"Bank Accounts",opening:$("#bo").value,side:$("#bs").value});toast("Bank account added");bank()});
 const upload=guard(async files=>{
   if(!BANK)return toast("Add a bank account first",true);
-  const out=[];
+  const mode=$("#ocrmode")?$("#ocrmode").value:"auto";
+  $("#bres").innerHTML=`<div class="msg" style="background:var(--bg)">Reading ${files.length} file(s)… a scanned page can take several seconds, please wait.</div>`;
+  const out=[];let open=null;
   for(const f of files){try{
-    const r=await api(`/api/bank/import?bank_id=${BANK}&filename=${encodeURIComponent(f.name)}`,undefined,await f.arrayBuffer());
-    out.push(`<div class="msg" style="background:var(--bg)"><b>${esc(f.name)}</b>: ${r.new} new, ${r.duplicates} already imported.${r.warnings.map(w=>`<div class="bad">⚠ ${esc(w)}</div>`).join("")}</div>`);
+    const r=await api(`/api/bank/import?bank_id=${BANK}&ocr=${mode}&filename=${encodeURIComponent(f.name)}`,undefined,await f.arrayBuffer());
+    if(r.ocr&&r.import_id)open=r.import_id;
+    const head=r.ocr?`scanned file read with ${esc(r.engine)}: ${r.new} row(s) found, <b class="red">${r.needs_review} need your verification</b> before they can be posted; ${r.duplicates} already imported.`
+                    :`${r.new} new, ${r.duplicates} already imported.`;
+    out.push(`<div class="msg" style="background:var(--bg)"><b>${esc(f.name)}</b>: ${head}${r.warnings.slice(0,6).map(w=>`<div class="bad">⚠ ${esc(w)}</div>`).join("")}</div>`);
   }catch(e){out.push(`<div class="msg" style="background:var(--warn)"><b>${esc(f.name)}</b>: ${esc(e.message)}</div>`)}}
-  $("#bres").innerHTML=out.join("");bankRows();
+  $("#bres").innerHTML=out.join("");bankRows();bankImports();
+  if(open)reviewOpen(open);
+});
+const bankImports=guard(async()=>{
+  const box=$("#bimps");if(!BANK||!box)return;
+  const rel=(await api("/api/bank/imports?bank_id="+BANK)).filter(i=>i.source==="ocr"||i.unverified>0);
+  box.style.display=rel.length?"":"none";
+  box.innerHTML=rel.length?`<h3>Scanned statements</h3>`+table(["File","Pages","Rows","To verify","Posted",""],rel.map(i=>`<tr><td>${esc(i.filename)}</td><td class="n">${i.pages}</td><td class="n">${i.rows}</td><td class="n${i.unverified?" red":""}">${i.unverified}</td><td class="n">${i.posted}</td><td><button class="b" onclick="reviewOpen(${i.id})">${i.unverified&&can("write")?"Verify":"View"}</button></td></tr>`),[1,2,3,4]):"";
 });
 const bankRows=guard(async()=>{
   if(!BANK){$("#brows").innerHTML='<p class="muted">Add a bank account to begin.</p>';return}
   const W=can("write");
   const T=await api(`/api/bank/txns?bank_id=${BANK}&posted=${$("#bp").checked?1:0}`);
-  $("#brows").innerHTML=table(["","Date","Narration","Debit","Credit","Ledger","Status"],T.map(t=>`<tr class="${t.posted?"muted":t.uncertain?"warn":""}"><td>${t.posted||!W?"":`<input type="checkbox" class="bsel" value="${t.id}">`}</td><td>${t.date}</td><td>${esc(t.narration)}</td><td class="n">${t.debit}</td><td class="n">${t.credit}</td>
+  $("#brows").innerHTML=table(["","Date","Narration","Debit","Credit","Ledger","Status"],T.map(t=>`<tr class="${t.posted?"muted":(t.uncertain||!t.verified)?"warn":""}"><td>${t.posted||!W?"":`<input type="checkbox" class="bsel" value="${t.id}" ${t.verified?"":'disabled title="Verify this scanned row first"'}>`}</td><td>${t.date}</td><td>${esc(t.narration)}</td><td class="n">${t.debit}</td><td class="n">${t.credit}</td>
    <td>${t.posted||!W?esc((ALL.find(l=>l.id===t.ledger_id)||{}).name||""):`<select onchange="setLedger(${t.id},this.value,'${esc(t.narration).replace(/'/g,"\\'")}')">${opts(ALL,"id","name",t.ledger_id,"— choose —")}</select>`}</td>
-   <td>${t.posted?"Posted":t.uncertain?"Check Dr/Cr":"Pending"}</td></tr>`),[3,4]);
-  const pend=T.filter(t=>!t.posted);if($("#bsum"))$("#bsum").textContent=`${pend.length} pending, ${pend.filter(t=>!t.ledger_id).length} without ledger`;
+   <td>${t.posted?"Posted":!t.verified?'<span class="red">Needs verification</span>':t.uncertain?"Check Dr/Cr":"Pending"}</td></tr>`),[3,4]);
+  const pend=T.filter(t=>!t.posted),unver=pend.filter(t=>!t.verified).length;
+  $("#bunver").innerHTML=unver?`<div class="msg" style="background:var(--warn)"><b class="red">${unver} scanned row(s) are not verified yet</b> and cannot be posted. Open <b>Scanned statements</b> above and check them against the page.</div>`:"";
+  if($("#bsum"))$("#bsum").textContent=`${pend.length} pending, ${pend.filter(t=>!t.ledger_id).length} without ledger${unver?", "+unver+" awaiting verification":""}`;
 });
 const setLedger=guard(async(id,lid,narr)=>{
   let learn="";if($("#bl").checked&&lid){learn=prompt("Remember this keyword for future imports:",narr.split(/\s+/).slice(0,2).join(" "))||""}
@@ -329,7 +361,136 @@ const bankPost=guard(async mode=>{
   let body={};
   if(mode==="sel"){body.ids=[...document.querySelectorAll(".bsel:checked")].map(x=>x.value);if(!body.ids.length)return toast("Tick the rows to post",true)}
   else{body.all_for_bank=BANK;if(mode==="susp"){if(!confirm("Rows without a ledger will be booked to 'Suspense A/c'. Continue?"))return;body.suspense=true}}
-  const r=await api("/api/bank/post",body);toast(`Posted ${r.posted} voucher(s). Skipped ${r.skipped} (no ledger or already posted).`);bank();
+  const r=await api("/api/bank/post",body);
+  toast(`Posted ${r.posted} voucher(s).${r.unverified?` ${r.unverified} scanned row(s) not verified yet.`:""} ${r.skipped-r.unverified>0?`${r.skipped-r.unverified} skipped (no ledger or already posted).`:""}`);bank();
+});
+
+/* ---------- verifying a scanned statement ---------- */
+// Everything OCR reads is unverified until a person has compared it with the page and saved it.
+const reviewOpen=guard(async(id,keep)=>{
+  const meta=(await api("/api/bank/imports?bank_id="+BANK)).find(i=>i.id===id);
+  if(!meta)throw new Error("Statement not found");
+  RV={imp:id,bank:BANK,sel:keep&&RV?RV.sel:null,page:keep&&RV?RV.page:1,meta,T:[],R:null};
+  $("#review").innerHTML=`<div class="card" style="border-color:var(--brand)">
+   <div class="row" style="margin:0 0 6px"><h3 style="margin:0">Verify scanned statement: ${esc(meta.filename)}</h3><span class="sp" style="flex:1"></span>
+    <span class="muted" id="rvcount"></span>
+    <label style="margin:0">Page view</label><select id="rvh" style="width:auto" onchange="$('#rvimg').style.maxHeight=this.value+'vh';rvHighlight()"><option value="24">Short</option><option value="38" selected>Medium</option><option value="62">Tall</option></select>
+    <button class="b" onclick="reviewClose()">Close</button></div>
+   <p class="muted" style="margin:0 0 8px">Compare each row with the page above (the selected row is highlighted and the page stays in view while you scroll). Correct what the OCR misread, then press <b>Save ✓</b> on that row.
+    Rows cannot be posted until they are verified. Rows whose running balance does not add up are marked in red, with suggested fixes.</p>
+   <div class="rv-grid"><div class="rv-img" id="rvimg"><div style="position:relative"><img id="pgimg" alt="scanned page"><div class="hl" id="hl"></div></div></div>
+    <div><div id="rvbody"></div></div></div></div>`;
+  rvShowPage();await reviewLoad();window.scrollTo(0,0);
+});
+function reviewClose(){RV=null;$("#review").innerHTML="";bankRows();bankImports()}
+function rvShowPage(){
+  const img=$("#pgimg");if(!img||!RV)return;
+  img.onload=rvHighlight;img.src=`/api/bank/page?import_id=${RV.imp}&page=${RV.page}`;
+}
+function rvPage(d){const n=Math.min(Math.max(RV.page+d,1),Math.max(RV.meta.pages,1));if(n!==RV.page){RV.page=n;rvShowPage();rvNav()}}
+function rvNav(){const el=$("#rvnav");if(el)el.innerHTML=RV.meta.pages>1?`<button class="b" onclick="rvPage(-1)">◀</button> page ${RV.page} of ${RV.meta.pages} <button class="b" onclick="rvPage(1)">▶</button>`:""}
+function rvHighlight(){
+  const img=$("#pgimg"),hl=$("#hl"),box=$("#rvimg");if(!img||!hl||!RV)return;
+  const t=RV.T.find(x=>x.id===RV.sel);
+  if(!t||t.page!==RV.page||!(t.y1>0)){hl.style.display="none";return}
+  const H=img.clientHeight,h=Math.max((t.y1-t.y0+0.012)*H,22);          // at least 22px, so it stays visible on a shrunken page
+  const top=Math.max(0,((t.y0+t.y1)/2)*H-h/2);
+  hl.style.cssText=`display:block;top:${top}px;height:${h}px`;
+  box.scrollTop=Math.max(0,top-box.clientHeight/2+h/2);
+}
+function reviewSelect(id){
+  if(!RV)return;const t=RV.T.find(x=>x.id===id);if(!t)return;
+  RV.sel=id;
+  document.querySelectorAll("#review tr.sel").forEach(r=>r.classList.remove("sel"));
+  const tr=$("#rv"+id);if(tr)tr.classList.add("sel");
+  if(t.page&&t.page!==RV.page){RV.page=t.page;rvShowPage();rvNav()}else rvHighlight();
+}
+const sumLine=R=>{
+  const bits=[];
+  if(R.opening!==null)bits.push(`Opening ${inr(R.opening)}${R.opening_inferred?" (taken from the first row)":""} + credits ${inr(R.credit_total)} − debits ${inr(R.debit_total)} = <b>${inr(R.closing_computed)}</b>`);
+  if(R.closing_stated!==null){const d=Number(R.closing_diff);bits.push(d===0?`<span class="ok">✓ matches the statement's closing balance ${inr(R.closing_stated)}</span>`:`<span class="red">✗ statement closing is ${inr(R.closing_stated)}, differs by ${inr(Math.abs(d))}</span>`)}
+  return bits.join(" &nbsp;·&nbsp; ")+`<br>Row checks: <span class="ok">${R.ok} add up</span> · <span class="${R.bad?"red":""}">${R.bad} do not</span> · ${R.unchecked} unchecked`;
+};
+function rvCheck(t,rec,prevId){
+  const h=[];
+  if(t.source==="ocr")h.push(`<span class="${t.confidence<0.8?"red":"muted"}">OCR confidence ${pct(t.confidence)}</span>`);
+  if(t.source==="manual")h.push(`<span class="muted">added by hand</span>`);
+  if(rec&&rec.ok===true)h.push(`<span class="ok">✓ balance adds up</span>`);
+  if(rec&&rec.ok===false){
+    h.push(`<span class="red">✗ balance should be ${inr(rec.expected)}</span>`);
+    if(rec.fix_amount)h.push(`<button class="b" onclick="rvUseAmount(${t.id},'${rec.fix_amount.side}','${rec.fix_amount.amount}',event)">Amount is ${inr(rec.fix_amount.amount)} ${rec.fix_amount.side}</button>`);
+    h.push(`<button class="b" onclick="rvUseBalance(${t.id},'${rec.expected}',event)">Balance is ${inr(rec.expected)}</button>`);
+    if(rec.missing_row)h.push(`<button class="b" onclick="rvInsertMissing(${prevId||0},${t.id},'${rec.missing_row.side}','${rec.missing_row.amount}',event)">A ${rec.missing_row.side} of ${inr(rec.missing_row.amount)} is missing above</button>`);
+  }
+  if(t.note&&t.source==="ocr")h.push(`<span class="muted">${esc(t.note)}</span>`);
+  return h.join("<br>");
+}
+function rvRow(t,i,rec,prevId){
+  const lock=t.posted||!can("write"),dis=lock?"disabled":"",bad=rec&&rec.ok===false;
+  const inp=(f,v,extra="")=>`<input data-f="${f}" value="${esc(v)}" ${dis} ${extra}>`;
+  return `<tr id="rv${t.id}" class="${t.posted?"muted":bad?"bad-row":""}${RV.sel===t.id?" sel":""}" onclick="reviewSelect(${t.id})">
+   <td><input type="checkbox" ${t.verified||t.posted?"checked":""} ${dis} title="Verified" onclick="event.stopPropagation()" onchange="rvToggle(${t.id},this.checked)"></td><td>${i+1}</td>
+   <td><input type="date" data-f="date" value="${t.date_iso}" ${dis}></td><td>${inp("narration",t.narration,'style="min-width:230px"')}</td>
+   <td>${inp("debit",t.debit_val,'inputmode="decimal" style="width:96px"')}</td><td>${inp("credit",t.credit_val,'inputmode="decimal" style="width:96px"')}</td>
+   <td>${inp("balance",t.balance_val,'inputmode="decimal" style="width:104px"')}</td>
+   <td><select ${dis} onclick="event.stopPropagation()" onchange="rvLedger(${t.id},this.value)" style="max-width:150px">${opts(ALL,"id","name",t.ledger_id,"— ledger —")}</select></td>
+   <td class="chk">${rvCheck(t,rec,prevId)}</td>
+   <td style="white-space:nowrap">${lock?(t.posted?"posted":""):`<button class="b p" onclick="rvSave(${t.id},event)">Save ✓</button> <button class="b" title="Add a missing row below this one" onclick="rvAddAfter(${t.id},event)">＋</button> <button class="b d" title="Delete this row (for lines the OCR invented)" onclick="rvDelete(${t.id},event)">✕</button>`}</td></tr>`;
+}
+async function reviewLoad(){
+  if(!RV)return;
+  const [T,R,I]=await Promise.all([api(`/api/bank/txns?bank_id=${BANK}&import_id=${RV.imp}&posted=1`),api("/api/bank/reconcile?import_id="+RV.imp),api("/api/bank/imports?bank_id="+BANK)]);
+  RV.T=T;RV.R=R;RV.meta=I.find(i=>i.id===RV.imp)||RV.meta;
+  if(!RV.sel||!T.find(x=>x.id===RV.sel)){const f=T.find(x=>!x.verified&&!x.posted)||T[0];RV.sel=f?f.id:null}
+  const rec={};R.rows.forEach(r=>rec[r.id]=r);
+  const done=T.filter(t=>t.verified||t.posted).length,W=can("write");
+  $("#rvcount").textContent=`${done} of ${T.length} rows verified`;
+  $("#rvbody").innerHTML=`<div id="rvnav" class="row" style="margin:0 0 8px"></div>
+   ${W?`<div class="row" style="margin:0 0 8px"><label style="margin:0">Opening balance on the statement</label><input id="rvo" value="${esc(RV.meta.opening)}" style="width:130px" inputmode="decimal">
+    <label style="margin:0">Closing balance</label><input id="rvc" value="${esc(RV.meta.closing)}" style="width:130px" inputmode="decimal"><button class="b" onclick="rvBalances()">Save balances</button></div>`:""}
+   <div class="msg" style="background:var(--bg);margin:0 0 8px">${sumLine(R)}</div>
+   ${W?`<div class="row" style="margin:0 0 8px"><button class="b p" onclick="rvVerifyOk()" title="Marks every row whose running balance adds up">Verify all rows that add up</button>
+    <button class="b" onclick="rvVerifyAll()">Verify all remaining…</button><button class="b" onclick="rvPost()">Post verified rows</button></div>`:""}
+   <div class="tw rvt" style="max-height:none"><table><thead><tr><th>✓</th><th>#</th><th>Date</th><th>Narration</th><th>Debit</th><th>Credit</th><th>Balance</th><th>Ledger</th><th>Check</th><th></th></tr></thead>
+   <tbody>${T.map((t,i)=>rvRow(t,i,rec[t.id],i?T[i-1].id:0)).join("")||'<tr><td colspan="10" class="muted">No rows.</td></tr>'}</tbody></table></div>`;
+  document.querySelectorAll("#rvbody tr[id^=rv] input[data-f]").forEach(el=>el.addEventListener("input",()=>el.closest("tr").classList.add("dirty")));
+  document.querySelectorAll("#rvbody tr[id^=rv] input[data-f]").forEach(el=>el.addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();rvSave(Number(el.closest("tr").id.slice(2)))}}));
+  rvNav();rvHighlight();
+}
+const rowVals=id=>{const tr=$("#rv"+id),g=f=>tr.querySelector(`[data-f="${f}"]`).value;return{id,date:g("date"),narration:g("narration"),debit:g("debit"),credit:g("credit"),balance:g("balance")}};
+const refresh=async()=>{await reviewLoad();bankRows();bankImports()};
+const rvSave=guard(async(id,ev)=>{if(ev)ev.stopPropagation();await api("/api/bank/update_txn",rowVals(id));toast("Row saved and verified");RV.sel=id;await refresh()});
+const rvToggle=guard(async(id,on)=>{
+  if($("#rv"+id).classList.contains("dirty")){await rvSave(id);return}            // unsaved edits: save them, then verify
+  await api("/api/bank/verify",{ids:[id],verified:on});await refresh();
+});
+const rvLedger=guard(async(id,lid)=>{await api("/api/bank/set_ledger",{ids:[id],ledger_id:lid||null});bankRows()});
+const rvDelete=guard(async(id,ev)=>{ev.stopPropagation();if(!confirm("Delete this row? Use this for lines the OCR invented, such as headings or footers."))return;await api("/api/bank/delete_txn",{ids:[id]});await refresh()});
+function rvUseAmount(id,side,amount,ev){ev.stopPropagation();const tr=$("#rv"+id);tr.querySelector('[data-f="debit"]').value=side==="debit"?amount:"";tr.querySelector('[data-f="credit"]').value=side==="credit"?amount:"";tr.classList.add("dirty")}
+function rvUseBalance(id,bal,ev){ev.stopPropagation();const tr=$("#rv"+id);tr.querySelector('[data-f="balance"]').value=bal;tr.classList.add("dirty")}
+const rvInsertMissing=guard(async(prevId,curId,side,amount,ev)=>{
+  ev.stopPropagation();const cur=rowVals(prevId||curId);                     // dates run forwards: start from the row above
+  const r=await api("/api/bank/add_txn",{import_id:RV.imp,after_id:prevId||null,date:cur.date,narration:"(missing row: fill in from the page)",
+    debit:side==="debit"?amount:"",credit:side==="credit"?amount:"",balance:"",verify:false});
+  RV.sel=r.id;await refresh();toast("Row inserted. Fill in its date and narration from the page, then press Save ✓");
+});
+const rvAddAfter=guard(async(id,ev)=>{
+  ev.stopPropagation();const a=prompt("Amount of the missing row. Type D (debit) or C (credit) then the amount, e.g.  D 5000","");if(a===null)return;
+  const m=/^\s*([DC])\s*([\d,]+(?:\.\d{1,2})?)\s*$/i.exec(a);if(!m)throw new Error("Type D or C followed by the amount, e.g. D 5000");
+  const d=m[1].toUpperCase()==="D",amt=m[2].replace(/,/g,"");
+  const r=await api("/api/bank/add_txn",{import_id:RV.imp,after_id:id,date:rowVals(id).date,narration:"(missing row: fill in from the page)",debit:d?amt:"",credit:d?"":amt,balance:"",verify:false});
+  RV.sel=r.id;await refresh();
+});
+const rvBalances=guard(async()=>{await api("/api/bank/balances",{import_id:RV.imp,opening:$("#rvo").value,closing:$("#rvc").value});await refresh()});
+const rvVerifyOk=guard(async()=>{const r=await api("/api/bank/verify_reconciled",{import_id:RV.imp});toast(`${r.verified} row(s) whose balance adds up were verified`);await refresh()});
+const rvVerifyAll=guard(async()=>{
+  const ids=RV.T.filter(t=>!t.verified&&!t.posted).map(t=>t.id);if(!ids.length)return toast("Every row is already verified");
+  if(!confirm(`Mark all ${ids.length} remaining row(s) as verified?\n\nOnly do this if you have compared every one with the page.`))return;
+  await api("/api/bank/verify",{ids,verified:true});await refresh();
+});
+const rvPost=guard(async()=>{
+  const r=await api("/api/bank/post",{all_for_bank:BANK});
+  toast(`Posted ${r.posted} verified voucher(s).${r.unverified?` ${r.unverified} unverified row(s) held back.`:""} ${r.skipped-r.unverified>0?`${r.skipped-r.unverified} skipped (no ledger chosen).`:""}`);await refresh();
 });
 
 /* ---------- reports & GST returns ---------- */

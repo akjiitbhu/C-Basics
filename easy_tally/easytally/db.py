@@ -83,7 +83,21 @@ CREATE TABLE IF NOT EXISTS bank_imports (
     id INTEGER PRIMARY KEY,
     bank_ledger_id INTEGER NOT NULL REFERENCES ledgers(id),
     filename TEXT NOT NULL,
-    imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source TEXT NOT NULL DEFAULT 'pdf',        -- 'pdf' (text layer) or 'ocr' (scan / photo)
+    pages INTEGER NOT NULL DEFAULT 0,
+    engine TEXT NOT NULL DEFAULT '',
+    opening_balance INTEGER,                   -- paise, typed in by the person verifying the scan
+    closing_balance INTEGER
+);
+
+-- Straightened page images kept for scans, so rows can be checked against the page later.
+CREATE TABLE IF NOT EXISTS bank_pages (
+    import_id INTEGER NOT NULL REFERENCES bank_imports(id) ON DELETE CASCADE,
+    page INTEGER NOT NULL,
+    mime TEXT NOT NULL DEFAULT 'image/jpeg',
+    image BLOB NOT NULL,
+    PRIMARY KEY (import_id, page)
 );
 
 CREATE TABLE IF NOT EXISTS bank_txns (
@@ -99,7 +113,15 @@ CREATE TABLE IF NOT EXISTS bank_txns (
     uncertain INTEGER NOT NULL DEFAULT 0,      -- direction (Dr/Cr) was guessed
     counter_ledger_id INTEGER REFERENCES ledgers(id),
     voucher_id INTEGER REFERENCES vouchers(id) ON DELETE SET NULL,
-    fingerprint TEXT NOT NULL UNIQUE
+    fingerprint TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL DEFAULT 'pdf',        -- 'pdf' | 'ocr' | 'manual'
+    verified INTEGER NOT NULL DEFAULT 1,       -- OCR rows start at 0 and cannot be posted until checked by a person
+    confidence REAL NOT NULL DEFAULT 1,
+    page INTEGER NOT NULL DEFAULT 0,
+    y0 REAL NOT NULL DEFAULT 0,                -- vertical band of the row on the page image (0..1)
+    y1 REAL NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    ord REAL                                   -- statement order (allows inserting a missing row between two rows)
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -209,7 +231,7 @@ def connect(path) -> sqlite3.Connection:
     return conn
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def migrate(conn: sqlite3.Connection):
@@ -233,9 +255,27 @@ def migrate(conn: sqlite3.Connection):
             conn.execute("DROP TABLE invoices")
             conn.execute("ALTER TABLE invoices_new RENAME TO invoices")
             conn.execute("PRAGMA foreign_keys = ON")
+    if version < 2:
+        # v2: scanned-statement support (page images, verification flag, row order)
+        _add_columns(conn, "bank_imports", {
+            "source": "TEXT NOT NULL DEFAULT 'pdf'", "pages": "INTEGER NOT NULL DEFAULT 0",
+            "engine": "TEXT NOT NULL DEFAULT ''", "opening_balance": "INTEGER", "closing_balance": "INTEGER"})
+        _add_columns(conn, "bank_txns", {
+            "source": "TEXT NOT NULL DEFAULT 'pdf'", "verified": "INTEGER NOT NULL DEFAULT 1",
+            "confidence": "REAL NOT NULL DEFAULT 1", "page": "INTEGER NOT NULL DEFAULT 0",
+            "y0": "REAL NOT NULL DEFAULT 0", "y1": "REAL NOT NULL DEFAULT 0",
+            "note": "TEXT NOT NULL DEFAULT ''", "ord": "REAL"})
+        conn.execute("UPDATE bank_txns SET ord = id WHERE ord IS NULL")
     _ensure_groups(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
+
+
+def _add_columns(conn, table, columns):
+    have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for name, decl in columns.items():
+        if name not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def _ensure_groups(conn):

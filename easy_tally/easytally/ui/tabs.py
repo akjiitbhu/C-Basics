@@ -444,7 +444,9 @@ class BankTab(BaseTab):
             try:
                 txns = parse_statement(path)
             except StatementError as e:
-                report.append(f"{path.split('/')[-1]}: {e}")
+                hint = ("\n   Scanned statements can be read with OCR and verified in the browser version "
+                        "(EasyTally (Browser))." if "no selectable text" in str(e) else "")
+                report.append(f"{path.split('/')[-1]}: {e}{hint}")
                 continue
             new, dup = self.books.stage_bank_transactions(bank_id, path, txns)
             report.append(f"{path.split('/')[-1]}: {new} new, {dup} already imported.")

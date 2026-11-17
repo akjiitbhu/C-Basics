@@ -1,5 +1,6 @@
 """Core double-entry bookkeeping engine: masters, vouchers, invoices, bank staging."""
 import hashlib
+import uuid
 import re
 import sqlite3
 from datetime import date, datetime
@@ -562,14 +563,19 @@ class Books:
                           (keyword, ledger_id))
         self.conn.commit()
 
-    def stage_bank_transactions(self, bank_ledger_id: int, filename: str, txns):
+    def stage_bank_transactions(self, bank_ledger_id: int, filename: str, txns, pages=None, engine: str = "",
+                                opening=None):
         """Store parsed statement rows. Returns (new_count, duplicate_count).
 
         A fingerprint of (bank, date, narration, debit, credit, balance, occurrence-in-file)
         makes re-importing the same statement (or an overlapping one) safe.
+        Rows read by OCR are stored *unverified*: they cannot be posted until a person has checked them.
+        `pages` are JPEG images of the scanned pages, kept so rows can be checked against them.
         """
-        cur = self.conn.execute("INSERT INTO bank_imports(bank_ledger_id, filename) VALUES (?,?)",
-                                (bank_ledger_id, Path(filename).name))
+        source = "ocr" if any(t.source == "ocr" for t in txns) else "pdf"
+        cur = self.conn.execute(
+            "INSERT INTO bank_imports(bank_ledger_id, filename, source, pages, engine, opening_balance) VALUES (?,?,?,?,?,?)",
+            (bank_ledger_id, Path(filename).name, source, len(pages or []), engine, opening))
         import_id = cur.lastrowid
         seen, new, dup = {}, 0, 0
         for t in txns:
@@ -578,28 +584,194 @@ class Books:
             fp = hashlib.sha1((repr(key) + str(seen[key])).encode()).hexdigest()
             counter = self.suggest_ledger(t.narration)
             try:
-                self.conn.execute(
+                c = self.conn.execute(
                     "INSERT INTO bank_txns(import_id, bank_ledger_id, date, narration, ref, debit, credit,"
-                    " balance, uncertain, counter_ledger_id, fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    " balance, uncertain, counter_ledger_id, fingerprint, source, verified, confidence, page,"
+                    " y0, y1, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (import_id, bank_ledger_id, t.date, t.narration, t.ref, t.debit, t.credit,
-                     t.balance, int(t.uncertain), counter, fp))
+                     t.balance, int(t.uncertain), counter, fp, t.source, 0 if t.source == "ocr" else 1,
+                     t.confidence, t.page, t.y0, t.y1, t.note))
+                self.conn.execute("UPDATE bank_txns SET ord = id WHERE id = ?", (c.lastrowid,))
                 new += 1
             except sqlite3.IntegrityError:
                 dup += 1
         if new == 0:
             self.conn.execute("DELETE FROM bank_imports WHERE id=?", (import_id,))
+        else:
+            for n, image in enumerate(pages or [], 1):
+                self.conn.execute("INSERT INTO bank_pages(import_id, page, image) VALUES (?,?,?)", (import_id, n, image))
         self.conn.commit()
         return new, dup
 
-    def bank_txns(self, bank_ledger_id=None, pending_only=False):
+    def bank_txns(self, bank_ledger_id=None, pending_only=False, import_id=None):
         q = ("SELECT t.*, l.name AS counter_name FROM bank_txns t "
              "LEFT JOIN ledgers l ON l.id = t.counter_ledger_id WHERE 1=1")
         args = []
         if bank_ledger_id:
             q += " AND t.bank_ledger_id = ?"; args.append(bank_ledger_id)
+        if import_id:
+            q += " AND t.import_id = ?"; args.append(import_id)
         if pending_only:
             q += " AND t.voucher_id IS NULL"
-        return self.conn.execute(q + " ORDER BY t.date, t.id", args).fetchall()
+        return self.conn.execute(q + (" ORDER BY t.ord, t.id" if import_id else " ORDER BY t.date, t.id"), args).fetchall()
+
+    # ---- verifying scanned statements --------------------------------------
+    def bank_imports(self, bank_ledger_id: int):
+        """One row per imported statement, newest first, with counts for the review list."""
+        return self.conn.execute(
+            """SELECT i.id, i.filename, i.source, i.pages, i.engine, i.imported_at,
+                      i.opening_balance, i.closing_balance,
+                      COUNT(t.id) AS rows,
+                      SUM(CASE WHEN t.verified = 0 AND t.voucher_id IS NULL THEN 1 ELSE 0 END) AS unverified,
+                      SUM(CASE WHEN t.voucher_id IS NOT NULL THEN 1 ELSE 0 END) AS posted
+               FROM bank_imports i LEFT JOIN bank_txns t ON t.import_id = i.id
+               WHERE i.bank_ledger_id = ? GROUP BY i.id ORDER BY i.id DESC""", (bank_ledger_id,)).fetchall()
+
+    def bank_page(self, import_id: int, page: int):
+        r = self.conn.execute("SELECT mime, image FROM bank_pages WHERE import_id=? AND page=?",
+                              (import_id, page)).fetchone()
+        return (r["mime"], bytes(r["image"])) if r else None
+
+    def _editable_txn(self, txn_id: int):
+        r = self.conn.execute("SELECT * FROM bank_txns WHERE id=?", (txn_id,)).fetchone()
+        if not r:
+            raise ValueError("Bank row not found")
+        if r["voucher_id"]:
+            raise ValueError("This row is already posted. Delete its voucher first if it must change.")
+        return r
+
+    @staticmethod
+    def _txn_amounts(debit, credit, balance):
+        d, c = to_paise(debit or "0"), to_paise(credit or "0")
+        if d < 0 or c < 0:
+            raise ValueError("Amounts cannot be negative")
+        if (d > 0) == (c > 0):
+            raise ValueError("Enter either a debit or a credit amount (not both, not neither)")
+        bal = None if balance in (None, "") else to_paise(balance)
+        return d, c, bal
+
+    def update_bank_txn(self, txn_id, date, narration, debit, credit, balance=None, verify=True):
+        """Correct a staged row after looking at the scan. Saving marks it verified unless verify=False."""
+        self._editable_txn(txn_id)
+        iso = parse_date(date)
+        narration = (narration or "").strip()
+        if not narration:
+            raise ValueError("Narration is required")
+        d, c, bal = self._txn_amounts(debit, credit, balance)
+        self.conn.execute(
+            "UPDATE bank_txns SET date=?, narration=?, debit=?, credit=?, balance=?, verified=?, uncertain=0 WHERE id=?",
+            (iso, narration, d, c, bal, int(bool(verify)), txn_id))
+        self.conn.commit()
+
+    def add_bank_txn(self, import_id, after_txn_id, date, narration, debit, credit, balance=None, verify=True):
+        """Add a row the OCR missed. It is placed right after `after_txn_id` (or first if None).
+        verify=False leaves it for a person to fill in and check (used for placeholder rows)."""
+        imp = self.conn.execute("SELECT * FROM bank_imports WHERE id=?", (import_id,)).fetchone()
+        if not imp:
+            raise ValueError("Statement not found")
+        iso = parse_date(date)
+        narration = (narration or "").strip()
+        if not narration:
+            raise ValueError("Narration is required")
+        d, c, bal = self._txn_amounts(debit, credit, balance)
+        page, y = 1, 0.0
+        if after_txn_id:
+            a = self.conn.execute("SELECT * FROM bank_txns WHERE id=? AND import_id=?", (after_txn_id, import_id)).fetchone()
+            if not a:
+                raise ValueError("The row to insert after was not found")
+            nxt = self.conn.execute("SELECT MIN(ord) FROM bank_txns WHERE import_id=? AND ord > ?",
+                                    (import_id, a["ord"])).fetchone()[0]
+            order = (a["ord"] + nxt) / 2 if nxt is not None else a["ord"] + 1
+            page, y = a["page"], a["y1"]
+        else:
+            first = self.conn.execute("SELECT MIN(ord) FROM bank_txns WHERE import_id=?", (import_id,)).fetchone()[0]
+            order = (first - 1) if first is not None else 1
+        fp = hashlib.sha1(f"manual|{uuid.uuid4()}".encode()).hexdigest()
+        cur = self.conn.execute(
+            "INSERT INTO bank_txns(import_id, bank_ledger_id, date, narration, debit, credit, balance, counter_ledger_id,"
+            " fingerprint, source, verified, page, y0, y1, ord, note) VALUES (?,?,?,?,?,?,?,?,?,'manual',?,?,?,?,?,?)",
+            (import_id, imp["bank_ledger_id"], iso, narration, d, c, bal, self.suggest_ledger(narration), fp,
+             int(bool(verify)), page, y, y, order, "added by hand"))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def delete_bank_txns(self, txn_ids):
+        for t in txn_ids:
+            self._editable_txn(t)
+        self.conn.executemany("DELETE FROM bank_txns WHERE id=?", [(t,) for t in txn_ids])
+        self.conn.commit()
+
+    def verify_bank_txns(self, txn_ids, verified=True):
+        """Mark staged rows as checked by a person (or un-check them). Posted rows are left alone."""
+        self.conn.executemany("UPDATE bank_txns SET verified=? WHERE id=? AND voucher_id IS NULL",
+                              [(int(bool(verified)), t) for t in txn_ids])
+        self.conn.commit()
+
+    def set_import_balances(self, import_id, opening, closing):
+        """Opening / closing balance as printed on the statement (blank clears)."""
+        o = None if opening in (None, "") else to_paise(opening)
+        c = None if closing in (None, "") else to_paise(closing)
+        self.conn.execute("UPDATE bank_imports SET opening_balance=?, closing_balance=? WHERE id=?", (o, c, import_id))
+        self.conn.commit()
+
+    def reconcile(self, import_id: int):
+        """Check a statement's running balance row by row, in statement order.
+
+        A row is OK when previous balance + credit - debit equals its printed balance. For a row that is not
+        OK we say what would fix it: its balance, its amount, or a missing row before it.
+        """
+        imp = self.conn.execute("SELECT * FROM bank_imports WHERE id=?", (import_id,)).fetchone()
+        if not imp:
+            raise ValueError("Statement not found")
+        rows = self.conn.execute("SELECT * FROM bank_txns WHERE import_id=? ORDER BY ord, id", (import_id,)).fetchall()
+        opening, inferred = imp["opening_balance"], False
+        prev = opening
+        out, ok_n, bad_n, unchecked, debits, credits = [], 0, 0, 0, 0, 0
+        for r in rows:
+            net = r["credit"] - r["debit"]
+            debits += r["debit"]
+            credits += r["credit"]
+            item = {"id": r["id"], "ok": None}
+            if r["balance"] is None:
+                prev = None if prev is None else prev + net
+                unchecked += 1
+            elif prev is None:                       # first row and no opening balance: it becomes the anchor
+                if opening is None:
+                    opening, inferred = r["balance"] - net, True
+                prev = r["balance"]
+                unchecked += 1
+            else:
+                expected = prev + net
+                if expected == r["balance"]:
+                    item["ok"] = True
+                    ok_n += 1
+                else:
+                    bad_n += 1
+                    delta = r["balance"] - prev
+                    missing = delta - net
+                    item.update(ok=False, expected=expected,
+                                fix_amount=({"side": "credit" if delta > 0 else "debit", "amount": abs(delta)}
+                                            if delta else None),
+                                missing_row=({"side": "credit" if missing > 0 else "debit", "amount": abs(missing)}
+                                             if missing else None))
+                prev = r["balance"]
+            out.append(item)
+        computed = None if opening is None else opening + credits - debits
+        stated = imp["closing_balance"]
+        return {"rows": out, "ok": ok_n, "bad": bad_n, "unchecked": unchecked, "debit_total": debits,
+                "credit_total": credits, "opening": opening, "opening_inferred": inferred,
+                "closing_computed": computed, "closing_stated": stated,
+                "closing_diff": None if stated is None or computed is None else stated - computed}
+
+    def verify_reconciled(self, import_id: int) -> int:
+        """Mark every unverified row whose running balance adds up as verified. Returns how many."""
+        rec = self.reconcile(import_id)
+        ok_ids = {x["id"] for x in rec["rows"] if x["ok"] is True}
+        todo = [r["id"] for r in self.conn.execute(
+            "SELECT id FROM bank_txns WHERE import_id=? AND verified=0 AND voucher_id IS NULL", (import_id,))
+            if r["id"] in ok_ids]
+        self.verify_bank_txns(todo, True)
+        return len(todo)
 
     def set_txn_ledger(self, txn_id: int, ledger_id, learn_keyword: str = ""):
         """Assign a counter ledger to a staged row. Optionally learn a keyword rule and apply it
@@ -625,7 +797,7 @@ class Books:
         try:
             for tid in txn_ids:
                 t = self.conn.execute("SELECT * FROM bank_txns WHERE id=?", (tid,)).fetchone()
-                if not t or t["voucher_id"]:
+                if not t or t["voucher_id"] or not t["verified"]:      # scanned rows need a person's check first
                     skipped += 1
                     continue
                 counter = t["counter_ledger_id"] or (suspense if use_suspense else None)

@@ -25,7 +25,7 @@ jobs:
       - name: Build EasyTally.exe
         run: >
           python -m PyInstaller --noconfirm --clean --windowed --name EasyTally
-          --collect-all pdfplumber --collect-all pdfminer --collect-all pypdfium2 --collect-all reportlab --collect-all openpyxl --add-data "easytally/web/static;easytally/web/static" run.py
+          --collect-all pdfplumber --collect-all pdfminer --collect-all pypdfium2 --collect-all reportlab --collect-all openpyxl --collect-all rapidocr_onnxruntime --collect-all onnxruntime --collect-all shapely --collect-all pyclipper --add-data "easytally/web/static;easytally/web/static" run.py
       - name: Smoke-test the built exe in browser mode
         shell: pwsh
         run: |
@@ -62,10 +62,24 @@ jobs:
           # PowerShell hands back XML as text (not bytes), so check it as a string
           $tm = (Invoke-WebRequest "$base/api/tally/masters.xml" -WebSession $s -UseBasicParsing).Content
           if ("$tm" -notmatch "<LEDGER ") { throw "Tally XML not generated" }
+          # scanned statement: OCR must work inside the frozen exe, and rows must arrive unverified
+          python tests/make_scanned_sample.py scan_sample.pdf table
+          $st = Invoke-RestMethod "$base/api/ocr/status" -WebSession $s
+          if (-not $st.available) { throw "OCR engine missing from the bundle: $($st.detail)" }
+          $bank = Call-Api "/api/ledgers" @{ name = "CI Bank"; group = "Bank Accounts"; opening = "50000" }
+          $imp = Invoke-RestMethod "$base/api/bank/import?bank_id=$($bank.id)&filename=scan.pdf" -Method Post -Headers $h -ContentType "application/octet-stream" -InFile scan_sample.pdf -WebSession $s -TimeoutSec 300
+          if (-not $imp.ocr) { throw "scanned PDF was not read with OCR" }
+          if ($imp.new -lt 5) { throw "OCR found only $($imp.new) rows" }
+          if ($imp.needs_review -ne $imp.new) { throw "OCR rows must start unverified" }
+          $pg = Get-Bytes "/api/bank/page?import_id=$($imp.import_id)&page=1"
+          if ($pg[0] -ne 255 -or $pg[1] -ne 216) { throw "page image missing" }
+          $post = Call-Api "/api/bank/post" @{ all_for_bank = $bank.id; suspense = $true }
+          if ($post.posted -ne 0 -or $post.unverified -ne $imp.new) { throw "unverified rows were posted" }
+          Write-Host "OCR in exe OK: $($imp.new) rows read, none postable until verified"
           $bk = Get-Bytes "/api/backup"
           if ([System.Text.Encoding]::ASCII.GetString($bk[0..1]) -ne "PK") { throw "backup not generated" }
           Call-Api "/api/shutdown" @{} | Out-Null
-          Write-Host "Frozen exe: web mode, sign-in, PDF, Excel, Tally XML and backup all OK"
+          Write-Host "Frozen exe: web mode, sign-in, PDF, Excel, Tally XML, OCR and backup all OK"
       - name: Build installer
         shell: pwsh
         run: |
