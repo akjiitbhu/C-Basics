@@ -109,11 +109,15 @@ def deskew(img):
 
 
 def _prepare(img):
-    from PIL import ImageOps
+    from PIL import ImageFilter, ImageOps
     img = ImageOps.exif_transpose(img).convert("L")
     if img.width * img.height > MAX_PIXELS:
         f = (MAX_PIXELS / (img.width * img.height)) ** 0.5
         img = img.resize((int(img.width * f), int(img.height * f)))
+    # A 3x3 median filter removes scanner speckle without touching text strokes. On simulated scans it lifted
+    # reading from 3-5 of 6 rows to 6 of 6 at every noise level tried (blurring or whitening the background
+    # made it worse).
+    img = img.filter(ImageFilter.MedianFilter(3))
     return ImageOps.autocontrast(img, cutoff=1)
 
 
