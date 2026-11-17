@@ -11,6 +11,13 @@ class Report:
     title: str
     columns: list
     rows: list = field(default_factory=list)
+    red: list = field(default_factory=list)      # per row: column indexes to show in red (may be shorter than rows)
+
+    def mark_red(self, columns):
+        """Flag columns of the most recently added row."""
+        while len(self.red) < len(self.rows) - 1:
+            self.red.append([])
+        self.red.append(list(columns))
 
 
 def _dr(p):  # debit column text
@@ -25,9 +32,15 @@ def day_book(b: Books, start, end) -> Report:
     r = Report(f"Day Book  {display_date(start)} to {display_date(end)}",
                ["Date", "Type", "No.", "Particulars", "Debit", "Credit", "Narration"])
     for v in b.vouchers(start, end):
-        for e in b.voucher_entries(v["id"]):
+        rows = b.conn.execute(
+            "SELECT e.ledger_id, e.amount, l.name FROM entries e JOIN ledgers l ON l.id=e.ledger_id "
+            "WHERE e.voucher_id=? ORDER BY e.amount DESC, e.id", (v["id"],)).fetchall()
+        over = {x[0] for x in b.cash_single_excess([(e["ledger_id"], e["amount"]) for e in rows])}
+        for e in rows:
             r.rows.append([display_date(v["date"]), v["vtype"], v["number"], e["name"],
                            _dr(e["amount"]), _cr(e["amount"]), v["narration"]])
+            if e["ledger_id"] in over:                  # cash entry above the limit
+                r.mark_red([4] if e["amount"] > 0 else [5])
     return r
 
 
@@ -47,6 +60,11 @@ def ledger_statement(b: Books, ledger_id: int, start, end) -> Report:
         running += row["amount"]
         r.rows.append([display_date(row["date"]), row["vtype"], row["number"], others or led["name"],
                        _dr(row["amount"]), _cr(row["amount"]), fmt_dr_cr(running)])
+        if led["group_name"] == "Cash-in-Hand":
+            signed = [(x["ledger_id"], x["amount"]) for x in b.conn.execute(
+                "SELECT ledger_id, amount FROM entries WHERE voucher_id=?", (row["id"],))]
+            if any(x[0] == ledger_id for x in b.cash_single_excess(signed)):
+                r.mark_red([4] if row["amount"] > 0 else [5])
     r.rows.append(["", "", "", "Closing Balance", "", "", fmt_dr_cr(running)])
     return r
 
@@ -229,6 +247,44 @@ def stock_summary(b: Books, as_on) -> Report:
     return r
 
 
+def cash_exceptions(b: Books, start, end) -> Report:
+    """Cash entries above the company's cash limits, plus same-day totals to one person that add up past them."""
+    pay, recv, mode = b.cash_limits()
+    r = Report(f"Cash Limit Exceptions  {display_date(start)} to {display_date(end)}   "
+               f"(payments over {fmt(pay)}, receipts over {fmt(recv)})",
+               ["Date", "Type", "No.", "Cash A/c", "Kind", "Party", "Amount", "Limit", "Issue"])
+    if mode == "off":
+        r.rows.append(["Cash limit checking is switched off (Admin > Company details).", "", "", "", "", "", "", "", ""])
+        return r
+    days = {}
+    for v in b.vouchers(start, end):
+        signed = [(x["ledger_id"], x["amount"]) for x in
+                  b.conn.execute("SELECT ledger_id, amount FROM entries WHERE voucher_id=?", (v["id"],))]
+        split = b._cash_split(signed)
+        if not split:
+            continue
+        cash, others, info = split
+        party = ", ".join(info[l][0] for l, _ in others)
+        for lid, amt, kind, limit in b.cash_single_excess(signed):
+            r.rows.append([display_date(v["date"]), v["vtype"], v["number"], info[lid][0], kind.title(), party,
+                           fmt(amt), fmt(limit), "Single cash entry above the limit"])
+            r.mark_red(range(len(r.columns)))
+        if len(others) == 1:
+            for l, a in cash:
+                key = (v["date"], others[0][0], "receipt" if a > 0 else "payment")
+                t = days.setdefault(key, [0, 0, party])
+                t[0] += abs(a); t[1] += 1
+    for (d, pid, kind), (total, n, party) in sorted(days.items()):
+        limit = recv if kind == "receipt" else pay
+        if n > 1 and limit > 0 and total > limit:
+            r.rows.append([display_date(d), "Day total", "", "(several)", kind.title(), party, fmt(total), fmt(limit),
+                           f"{n} cash entries on the same day add up to more than the limit"])
+            r.mark_red(range(len(r.columns)))
+    if not r.rows:
+        r.rows.append(["No cash entries above the limit in this period.", "", "", "", "", "", "", "", ""])
+    return r
+
+
 BUCKETS = [("0-30", 0, 30), ("31-60", 31, 60), ("61-90", 61, 90), ("Over 90", 91, 10 ** 6)]
 
 
@@ -324,7 +380,7 @@ def export_csv(report: Report, path):
 
 
 REPORT_NAMES = ["Day Book", "Ledger Statement", "Trial Balance", "Profit & Loss", "Balance Sheet",
-                "GST Summary", "Stock Summary", "Receivables Ageing", "Payables Ageing", "Outstanding Bills"]
+                "GST Summary", "Stock Summary", "Receivables Ageing", "Payables Ageing", "Outstanding Bills", "Cash Limit Exceptions"]
 
 
 def run_report(b: Books, name: str, start: str, end: str, ledger_id=None) -> Report:
@@ -345,6 +401,8 @@ def run_report(b: Books, name: str, start: str, end: str, ledger_id=None) -> Rep
         return gst_summary(b, start, end)
     if name == "Stock Summary":
         return stock_summary(b, end)
+    if name == "Cash Limit Exceptions":
+        return cash_exceptions(b, start, end)
     if name == "Receivables Ageing":
         return ageing(b, end, True)
     if name == "Payables Ageing":

@@ -4,7 +4,7 @@ from datetime import date
 from tkinter import ttk, filedialog, messagebox
 
 from .. import reports
-from ..accounting import VOUCHER_TYPES, display_date, fy_start, parse_date
+from ..accounting import VOUCHER_TYPES, CashLimitError, display_date, fy_start, parse_date
 from ..bank_import import StatementError, check_consistency, parse_statement
 from ..gst import GST_RATES, STATES
 from ..money import fmt, fmt_dr_cr, to_paise
@@ -216,9 +216,18 @@ class VoucherTab(BaseTab):
 
     def save(self):
         ids = self.ledger_map()
+        args = (self.vtype.get(), self.vdate.get(), [(ids[n], s, a) for n, s, a in self.lines],
+                self.narr.get(), self.ref.get())
         try:
-            self.books.add_voucher(self.vtype.get(), self.vdate.get(),
-                                   [(ids[n], s, a) for n, s, a in self.lines], self.narr.get(), self.ref.get())
+            try:
+                self.books.add_voucher(*args)
+            except CashLimitError as e:
+                if e.blocked:
+                    return _error("Cash limit: " + "; ".join(e.warnings) + "\n\nThis company blocks entries above the limit.")
+                if not messagebox.askyesno("EasyTally - cash limit",
+                                           "\n".join(e.warnings) + "\n\nSave this entry anyway?"):
+                    return
+                self.books.add_voucher(*args, cash_check="confirmed")
         except (ValueError, KeyError) as e:
             return _error(e)
         self.clear()

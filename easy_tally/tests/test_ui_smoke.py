@@ -101,6 +101,24 @@ class UISmoke(unittest.TestCase):
         self.assertEqual(self.errors(), [])
         self.assertEqual(len(self.books.vouchers()), 1)
 
+    def test_desktop_asks_before_saving_over_the_cash_limit(self):
+        self.books.add_ledger("Supplier", "Sundry Creditors")
+        v = self.vouchers
+        v.refresh()
+        v.vtype.set("Payment"); v.vdate.set("01-04-2026")
+        for name, side in (("Supplier", "Dr"), ("Cash", "Cr")):
+            v.ledger.set(name); v.side.set(side); v.amount.set("25000"); v.add_line()
+        asked = []
+        MB.askyesno = lambda title, text, **k: (asked.append(text), False)[1]       # user says "no"
+        v.save()
+        self.assertEqual(len(asked), 1)
+        self.assertIn("above the limit of 10,000.00", asked[0])
+        self.assertEqual(len(self.books.vouchers()), 0)                              # declined: nothing saved
+        MB.askyesno = lambda *a, **k: True                                           # user says "yes"
+        v.save()
+        self.assertEqual(len(self.books.vouchers()), 1)
+        self.assertEqual(self.errors(), [])
+
     def test_voucher_unknown_ledger_rejected(self):
         self.vouchers.ledger.set("Nope"); self.vouchers.amount.set("5"); self.vouchers.add_line()
         self.assertEqual(len(self.errors()), 1)

@@ -45,6 +45,7 @@ To build it yourself on Windows: run `build_windows.bat` in this folder.
 | GST documents | Sales and purchase invoices, **credit notes** (sales returns) and **debit notes** (purchase returns). CGST+SGST or IGST by state; stock follows. Invoices and notes can be edited. |
 | **PDF invoices** | One-click printable tax invoice / credit note / debit note with company details, HSN, tax split, amount in words (Indian system), bank details and terms. |
 | **Bank statement import** | Pick PDFs, review, map to ledgers, post as vouchers (details below). |
+| **Cash limit checks** | Cash payments above the limit (default ₹10,000, Sec 40A(3)) and cash receipts above the limit (default ₹1,99,999.99, i.e. ₹2 lakh or more, Sec 269ST) are shown in **red** while you type, in the voucher list, Day Book and Ledger, and in the *Cash Limit Exceptions* report. Same-day cash with one person is added up. On save you are asked to confirm (or the entry is blocked, your choice in Admin > Company details). Overrides are in the audit trail. Moves between your own cash and bank accounts are not checked. |
 | **Receivables and payables** | Ageing (0-30 / 31-60 / 61-90 / over 90 days) and bill-wise outstanding per customer or supplier, with receipts, payments and notes settled oldest-first (FIFO). |
 | **GST returns** | **GSTR-1** (B2B, B2C large and small, credit notes, HSN summary, document series) and **GSTR-3B** summary as JSON in the GST offline-tool layout, plus Excel working papers and a list of warnings (missing HSN, bad GSTIN, long invoice numbers...). |
 | **Tally exchange** | Export ledgers and vouchers as Tally XML; import a Tally XML export (groups, ledgers, opening balances, accounting vouchers). Imports are de-duplicated. |
@@ -102,6 +103,11 @@ sample to `tests/` and extend `_locate_columns` or the text parser.
 - **Tally exchange** covers ledgers and accounting vouchers only. Stock items, inventory entries and bill
   references are not carried over, and imported sales are plain vouchers, so they do not feed the GST returns.
   Tally's XML varies by version; test with a copy before relying on it.
+- **Cash limits** are an internal control, not tax advice: the rules have exceptions (for example higher
+  limits for transporters, and receipts from banks or the government), so adjust the limits to your case.
+  A day's total is added up only for vouchers with a single other party. Tally imports are not checked
+  when they come in, but show up in the Cash Limit Exceptions report. The desktop window asks for
+  confirmation but does not colour lists red.
 - Not included: payroll, cost centres, budgets, multi-currency, bank reconciliation screen, financial-year
   closing, multi-PC or network use (one machine only).
 - The desktop window has the same books but not every new screen: editing vouchers and invoices, PDF

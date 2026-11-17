@@ -219,6 +219,38 @@ class Features(WebBase):
         ag = self.c.j("/api/report?name=Receivables%20Ageing&start=2026-04-01&end=2026-04-30")[1]
         self.assertEqual(ag["rows"][-1][1], "930.00")
 
+    def test_cash_limit_flow(self):
+        cash = [l["id"] for l in self.c.j("/api/ledgers")[1] if l["name"] == "Cash"][0]
+        pay = lambda amt, date="2026-04-10", **extra: self.c.j("/api/vouchers", {"vtype": "Payment", "date": date, "lines": [
+            {"ledger_id": self.cust, "side": "Dr", "amount": amt}, {"ledger_id": cash, "side": "Cr", "amount": amt}], **extra})
+        self.assertEqual(self.c.j("/api/meta")[1]["cash_limits"], {"payment": 10000.0, "receipt": 199999.99, "mode": "warn"})
+        s, r = pay("25000")                                            # above the limit: asks first
+        self.assertEqual(s, 409)
+        self.assertFalse(r["blocked"])
+        self.assertIn("above the limit of 10,000.00", r["cash_warning"][0])
+        self.assertEqual(len([v for v in self.c.j("/api/vouchers")[1] if v["vtype"] == "Payment"]), 0)   # nothing saved
+        s, r = pay("25000", confirm_cash=True)                         # user confirmed
+        self.assertEqual(s, 200)
+        listed = [v for v in self.c.j("/api/vouchers")[1] if v["vtype"] == "Payment"][0]
+        self.assertTrue(listed["cash_over"])
+        self.assertFalse(self.c.j("/api/vouchers")[1][-1]["cash_over"])             # the sales invoice is not
+        # the override is on the audit trail
+        self.assertIn('"confirm_cash": true', self.c.j("/api/audit")[1][0]["detail"])
+        # reports carry the red flags
+        rep = self.c.j("/api/report?name=Day%20Book&start=2026-04-01&end=2026-04-30")[1]
+        self.assertEqual([rep["rows"][i][3:6] for i, cols in enumerate(rep["red"]) if cols], [["Cash", "", "25,000.00"]])
+        ex = self.c.j("/api/report?name=Cash%20Limit%20Exceptions&start=2026-04-01&end=2026-04-30")[1]
+        self.assertEqual((len(ex["rows"]), ex["rows"][0][6]), (1, "25,000.00"))
+        self.assertEqual(ex["red"][0], list(range(len(ex["columns"]))))
+        # settings: raise the limit, then switch to blocking
+        self.assertEqual(self.c.j("/api/settings", {"cash_payment_limit": "50000"})[0], 200)
+        self.assertEqual(pay("30000")[0], 409)                                     # same day, same party: 25,000 + 30,000 > 50,000
+        self.assertEqual(pay("30000", date="2026-04-11")[0], 200)                  # another day is within the new limit
+        self.c.j("/api/settings", {"cash_limit_mode": "block"})
+        s, r = pay("60000", date="2026-04-12", confirm_cash=True)
+        self.assertEqual((s, r["blocked"]), (400, True))                          # confirmation cannot override a block
+        self.assertEqual(self.c.j("/api/settings", {"cash_limit_mode": "whenever"})[0], 400)
+
     def test_backup_restore_api(self):
         s, z = self.c.call("/api/backup")
         self.assertEqual(s, 200)

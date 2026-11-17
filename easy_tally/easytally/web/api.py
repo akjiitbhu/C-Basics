@@ -12,7 +12,7 @@ import threading
 from calendar import monthrange
 
 from .. import auth, backup, db, gst_returns, reports, tally_xml
-from ..accounting import INVOICE_KINDS, Books, display_date, parse_date
+from ..accounting import INVOICE_KINDS, Books, CashLimitError, display_date, parse_date
 from ..bank_import import StatementError, check_consistency, parse_statement
 from ..gst import GST_RATES, STATES
 from ..invoice_pdf import invoice_pdf
@@ -91,6 +91,10 @@ class Api:
                 return 200, result, ctx.cookie
             except ApiError as e:
                 return e.status, {"error": str(e), **e.extra}, ctx.cookie
+            except CashLimitError as e:
+                # Not blocked: 409 so the page can ask "post anyway?". Blocked by the company's setting: 400.
+                return (400 if e.blocked else 409), {"error": str(e), "cash_warning": e.warnings,
+                                                     "blocked": e.blocked}, ctx.cookie
             except (ValueError, auth.AuthError) as e:     # validation errors raised by the engine
                 return 400, {"error": str(e)}, ctx.cookie
 
@@ -164,7 +168,12 @@ class Api:
                 "states": [{"code": c, "name": n} for c, n in STATES.items()],
                 "vtypes": VOUCHER_TYPES, "invoice_kinds": INVOICE_KINDS, "gst_rates": GST_RATES,
                 "groups": [g["name"] for g in self.books.groups()] if (self.books and signed_in) else [],
-                "reports": reports.REPORT_NAMES}
+                "reports": reports.REPORT_NAMES,
+                "cash_limits": self._cash_meta() if (self.books and signed_in) else None}
+
+    def _cash_meta(self):
+        pay, recv, mode = self.books.cash_limits()
+        return {"payment": pay / 100, "receipt": recv / 100, "mode": mode}
 
     def companies(self, q, body, raw):
         return [{"slug": s, "name": n} for s, n in Books.list_companies()]
@@ -233,10 +242,12 @@ class Api:
         b, out = self._b(), []
         for v in list(reversed(b.vouchers()))[:200]:
             es = b.voucher_entries(v["id"])
+            cash = b.voucher_cash_warnings(v["id"])
             out.append({"id": v["id"], "date": display_date(v["date"]), "vtype": v["vtype"],
                         "number": v["number"], "particulars": " / ".join(e["name"] for e in es),
                         "amount": fmt(sum(e["amount"] for e in es if e["amount"] > 0)),
-                        "narration": v["narration"], "invoice": b._is_invoice(v["id"])})
+                        "narration": v["narration"], "invoice": b._is_invoice(v["id"]),
+                        "cash_over": bool(cash), "cash_note": "; ".join(cash)})
         return out
 
     def voucher_get(self, q, body, raw):
@@ -255,12 +266,14 @@ class Api:
 
     def voucher_add(self, q, body, raw):
         vid = self._b().add_voucher(body.get("vtype", ""), body.get("date", ""), self._voucher_lines(body),
-                                    body.get("narration", ""), body.get("ref", ""))
+                                    body.get("narration", ""), body.get("ref", ""),
+                                    cash_check="confirmed" if body.get("confirm_cash") else "ask")
         return {"id": vid}
 
     def voucher_update(self, q, body, raw):
         self._b().update_voucher(_int(body.get("id")), body.get("date", ""), self._voucher_lines(body),
-                                 body.get("narration", ""), body.get("ref", ""))
+                                 body.get("narration", ""), body.get("ref", ""),
+                                 cash_check="confirmed" if body.get("confirm_cash") else "ask")
         return {"ok": True}
 
     def voucher_delete(self, q, body, raw):
@@ -363,7 +376,7 @@ class Api:
 
     def report(self, q, body, raw):
         r = self._report(q)
-        return {"title": r.title, "columns": r.columns, "rows": r.rows}
+        return {"title": r.title, "columns": r.columns, "rows": r.rows, "red": [list(x) for x in r.red]}
 
     def report_csv(self, q, body, raw):
         r = self._report(q)

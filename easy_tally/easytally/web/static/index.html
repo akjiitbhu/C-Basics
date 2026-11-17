@@ -36,7 +36,7 @@ tr.muted td{color:var(--muted)}tr.warn td{background:var(--warn)}tr.bold td{font
 #toast.bad{background:var(--bad)}
 .picker{max-width:560px;margin:50px auto}.picker li{list-style:none}
 .co-btn{display:block;width:100%;text-align:left;margin:6px 0;padding:11px 14px}
-.muted{color:var(--muted)}.bad{color:var(--bad)}.ok{color:var(--good)}ul.w{margin:6px 0 0 18px;padding:0}ul.w li{margin:3px 0}textarea{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--ink);font:inherit;min-height:60px}.tot{font-weight:600}
+.muted{color:var(--muted)}.bad{color:var(--bad)}.red{color:var(--bad)!important;font-weight:700}.ok{color:var(--good)}ul.w{margin:6px 0 0 18px;padding:0}ul.w li{margin:3px 0}textarea{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--ink);font:inherit;min-height:60px}.tot{font-weight:600}
 .drop{border:2px dashed var(--line);border-radius:10px;padding:18px;text-align:center;color:var(--muted)}
 .drop.over{border-color:var(--brand);background:var(--bg)}
 </style>
@@ -68,7 +68,7 @@ async function api(path,body,raw){
   else if(body!==undefined){o.method="POST";o.headers["Content-Type"]="application/json";o.body=JSON.stringify(body)}
   const r=await fetch(path,o);let j;try{j=await r.json()}catch{j={error:"Unexpected response"}}
   if(r.status===401&&!path.startsWith("/api/auth/")){ME=null;boot();throw new Error(j.error||"Please sign in.")}
-  if(!r.ok)throw new Error(j.error||r.statusText);return j;
+  if(!r.ok){const e=new Error(j.error||r.statusText);e.data=j;e.status=r.status;throw e}return j;
 }
 let tt;function toast(m,bad){const t=$("#toast");t.textContent=m;t.className=bad?"bad":"";t.style.display="block";clearTimeout(tt);tt=setTimeout(()=>t.style.display="none",bad?7000:3500)}
 const guard=fn=>async(...a)=>{try{return await fn(...a)}catch(e){toast(e.message,true)}};
@@ -155,6 +155,25 @@ const delLedger=guard(async id=>{await api("/api/ledgers/delete",{id});masters()
 const addItem=guard(async()=>{await api("/api/items",{name:$("#in").value,unit:$("#iu").value,hsn:$("#ih").value,gst_rate:$("#ir").value,opening_qty:$("#iq").value,opening_value:$("#iv").value});toast("Item added");masters()});
 const delItem=guard(async id=>{await api("/api/items/delete",{id});masters()});
 
+/* ---------- cash limits ---------- */
+const CASH="Cash-in-Hand", OWN=["Bank Accounts","Cash-in-Hand"];
+const inr=n=>Number(n).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+// Live check of the lines being typed. (The server also adds up same-day totals to one person when saving.)
+function cashCheck(lines){
+  const cl=META.cash_limits;const res={flags:lines.map(()=>false),msgs:[]};
+  if(!cl||cl.mode==="off")return res;
+  const others=lines.filter(l=>l.group!==CASH);
+  if(!lines.some(l=>l.group===CASH)||others.every(l=>OWN.includes(l.group)))return res;     // own cash/bank transfer
+  const who=others.map(l=>l.name).join(", ");
+  lines.forEach((l,i)=>{
+    if(l.group!==CASH)return;const amt=paise(l.amount)/100;
+    const rec=l.side==="Dr",limit=rec?cl.receipt:cl.payment;
+    if(limit>0&&amt>limit){res.flags[i]=true;res.msgs.push(`Cash ${rec?"receipt":"payment"} of ${inr(amt)} ${rec?"from":"to"} ${who} is above the limit of ${inr(limit)}`+(rec?" (Sec 269ST)":" (Sec 40A(3))"))}
+  });
+  return res;
+}
+const cashNote=()=>{const c=META.cash_limits;return c&&c.mode!=="off"?`Cash limits: payments above ₹${inr(c.payment)}, receipts above ₹${inr(c.receipt)} are shown in red (${c.mode==="block"?"entries are blocked":"you will be asked to confirm"}).`:""};
+
 /* ---------- vouchers ---------- */
 let VL=[], LEDG=[], VEDIT=null;
 const paise=s=>Math.round(parseFloat(String(s).replace(/,/g,""))*100)||0;
@@ -169,34 +188,47 @@ async function vouchers(){
    <div class="grid" style="margin-top:10px"><div style="grid-column:span 2"><label>Ledger</label><select id="vl">${opts(L,"id","name","","Select ledger…")}</select></div>
    <div><label>Dr / Cr</label><select id="vs"><option>Dr</option><option>Cr</option></select></div>
    <div><label>Amount</label><input id="va" inputmode="decimal"></div><div><button class="b" onclick="vAdd()">Add line</button></div></div>
-   <div id="vlines"></div>
+   <div id="vlines"></div><div id="vcash" class="bad" style="margin-top:6px"></div>
+   <div class="muted" style="font-size:12px;margin-top:4px">${esc(cashNote())}</div>
    <div class="row"><button class="b p" onclick="vSave()">${VEDIT?"Update voucher":"Save voucher"}</button><button class="b" onclick="VEDIT=null;VL=[];vouchers()">${VEDIT?"Cancel edit":"Clear"}</button><span id="vtot" class="tot"></span></div></div>`:""}
-  <div class="card"><h3>Recent vouchers</h3>${table(["Date","Type","No.","Particulars","Amount","Narration",""],V.map(v=>`<tr><td>${v.date}</td><td>${v.vtype}</td><td>${v.number}</td><td>${esc(v.particulars)}</td><td class="n">${v.amount}</td><td>${esc(v.narration)}</td><td>${W?(v.invoice?`<button class="b" onclick="iEdit(${v.id})">Edit invoice</button>`:`<button class="b" onclick="vEdit(${v.id})">Edit</button>`):""} ${delBtn("vDel",v.id)}</td></tr>`),[4])}</div>`;
+  <div class="card"><h3>Recent vouchers</h3>${table(["Date","Type","No.","Particulars","Amount","Narration",""],V.map(v=>`<tr><td>${v.date}</td><td>${v.vtype}</td><td>${v.number}</td><td>${esc(v.particulars)}</td><td class="n${v.cash_over?" red":""}"${v.cash_over?` title="${esc(v.cash_note)}"`:""}>${v.amount}${v.cash_over?" ⚠ cash limit":""}</td><td>${esc(v.narration)}</td><td>${W?(v.invoice?`<button class="b" onclick="iEdit(${v.id})">Edit invoice</button>`:`<button class="b" onclick="vEdit(${v.id})">Edit</button>`):""} ${delBtn("vDel",v.id)}</td></tr>`),[4])}</div>`;
   if(W)vRender();
 }
 function vRender(){
   const dr=VL.filter(l=>l.side==="Dr").reduce((a,l)=>a+paise(l.amount),0),cr=VL.filter(l=>l.side==="Cr").reduce((a,l)=>a+paise(l.amount),0);
-  $("#vlines").innerHTML=VL.length?table(["Ledger","Dr/Cr","Amount",""],VL.map((l,i)=>`<tr><td>${esc(l.name)}</td><td>${l.side}</td><td class="n">${money(paise(l.amount))}</td><td><button class="b d" onclick="VL.splice(${i},1);vRender()">Remove</button></td></tr>`),[2]):"";
+  const cc=cashCheck(VL);
+  $("#vlines").innerHTML=VL.length?table(["Ledger","Dr/Cr","Amount",""],VL.map((l,i)=>`<tr><td>${esc(l.name)}</td><td>${l.side}</td><td class="n${cc.flags[i]?" red":""}">${money(paise(l.amount))}${cc.flags[i]?" ⚠":""}</td><td><button class="b d" onclick="VL.splice(${i},1);vRender()">Remove</button></td></tr>`),[2]):"";
+  $("#vcash").innerHTML=cc.msgs.map(m=>`<div class="red">⚠ ${esc(m)}</div>`).join("");
   $("#vtot").textContent=`Dr ${money(dr)}   Cr ${money(cr)}   ${dr===cr&&dr?"✓ balanced":"difference "+money(Math.abs(dr-cr))}`;
 }
 function vAdd(){
   const id=$("#vl").value;if(!id)return toast("Choose a ledger",true);
   if(paise($("#va").value)<=0)return toast("Enter an amount greater than zero",true);
-  VL.push({ledger_id:id,name:LEDG.find(l=>String(l.id)===id).name,side:$("#vs").value,amount:$("#va").value});
+  const led=LEDG.find(l=>String(l.id)===id);
+  VL.push({ledger_id:id,name:led.name,group:led.group,side:$("#vs").value,amount:$("#va").value});
   const dr=VL.filter(l=>l.side==="Dr").reduce((a,l)=>a+paise(l.amount),0),cr=VL.filter(l=>l.side==="Cr").reduce((a,l)=>a+paise(l.amount),0);
   $("#vs").value=dr>cr?"Cr":"Dr";$("#va").value=dr!==cr?(Math.abs(dr-cr)/100).toFixed(2):"";$("#vl").value="";vRender();
 }
 const vEdit=guard(async id=>{
   const v=await api("/api/voucher?id="+id);
-  VEDIT=id;VL=v.entries.map(e=>({ledger_id:String(e.ledger_id),name:e.name,side:e.side,amount:e.amount}));
+  await vouchers();                       // loads LEDG so each line can be matched to its group
+  VEDIT=id;VL=v.entries.map(e=>({ledger_id:String(e.ledger_id),name:e.name,group:(LEDG.find(l=>l.id===e.ledger_id)||{}).group,side:e.side,amount:e.amount}));
   await vouchers();
   $("#vt").innerHTML=sopts([...new Set([v.vtype,...META.vtypes])],v.vtype);
   $("#vd").value=v.date;$("#vn").value=v.narration;$("#vr").value=v.ref;vRender();window.scrollTo(0,0);
 });
 const vSave=guard(async()=>{
   const body={date:$("#vd").value,narration:$("#vn").value,ref:$("#vr").value,lines:VL};
-  if(VEDIT){await api("/api/vouchers/update",{id:VEDIT,...body});toast("Voucher updated")}
-  else{await api("/api/vouchers",{vtype:$("#vt").value,...body});toast("Voucher saved")}
+  const send=extra=>VEDIT?api("/api/vouchers/update",{id:VEDIT,...body,...extra}):api("/api/vouchers",{vtype:$("#vt").value,...body,...extra});
+  try{await send({})}
+  catch(e){
+    const w=e.data&&e.data.cash_warning;
+    if(!w)throw e;
+    if(e.data.blocked)throw new Error("Cash limit: "+w.join("; ")+". This company blocks entries above the limit (Admin > Company details).");
+    if(!confirm("⚠ CASH LIMIT\n\n"+w.join("\n")+"\n\nSave this entry anyway? It will be marked in red and recorded in the audit trail."))return;
+    await send({confirm_cash:true});
+  }
+  toast(VEDIT?"Voucher updated":"Voucher saved");
   VEDIT=null;VL=[];vouchers();
 });
 const vDel=guard(async id=>{if(confirm("Delete this voucher?")){await api("/api/vouchers/delete",{ids:[id]});if(VEDIT===id){VEDIT=null;VL=[]}vouchers()}});
@@ -302,7 +334,7 @@ const bankPost=guard(async mode=>{
 
 /* ---------- reports & GST returns ---------- */
 let RQ={name:"Day Book",start:fyStart(),end:today(),ledger:""}, RL=[];
-const NUMCOL=/^(Debit|Credit|Amount|Balance|Taxable|CGST|SGST|IGST|Value|Avg Cost|Closing Qty|Inward|Outward|Outstanding|Pending|Advance|0-30|31-60|61-90|Over 90|Age \(days\))$/;
+const NUMCOL=/^(Debit|Credit|Amount|Balance|Taxable|CGST|SGST|IGST|Value|Avg Cost|Closing Qty|Inward|Outward|Outstanding|Pending|Advance|0-30|31-60|61-90|Over 90|Limit|Age \(days\))$/;
 async function reports(){
   RL=await api("/api/ledgers");
   const lastMonth=(()=>{const d=new Date();d.setDate(1);d.setMonth(d.getMonth()-1);return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")})();
@@ -326,7 +358,7 @@ const runReport=guard(async(quiet)=>{
   try{r=await api("/api/report?"+qs)}
   catch(e){if(quiet===true){$("#rout").innerHTML=`<div class="card muted">${esc(e.message)}</div>`;return}throw e}
   const num=r.columns.map((c,i)=>NUMCOL.test(c)?i:-1).filter(i=>i>=0);
-  $("#rout").innerHTML=`<div class="card"><h3>${esc(r.title)}</h3>${table(r.columns,r.rows.map(x=>`<tr class="${/^(TOTAL|NET|Total|Closing Balance|[A-Z &]+$)/.test(x[0])&&x[0]?"bold":""}">${x.map((c,i)=>`<td class="${num.includes(i)?"n":""}">${esc(c)}</td>`).join("")}</tr>`),num)}</div>`;
+  $("#rout").innerHTML=`<div class="card"><h3>${esc(r.title)}</h3>${table(r.columns,r.rows.map((x,ri)=>{const red=(r.red||[])[ri]||[];return `<tr class="${/^(TOTAL|NET|Total|Closing Balance|[A-Z &]+$)/.test(x[0])&&x[0]?"bold":""}">${x.map((c,i)=>`<td class="${num.includes(i)?"n":""}${red.includes(i)?" red":""}">${esc(c)}</td>`).join("")}</tr>`}),num)}</div>`;
 });
 const gstCheck=guard(async()=>{
   const m=$("#gm").value;if(!m)throw new Error("Choose a month");
@@ -346,6 +378,11 @@ async function admin(){
   $("#main").innerHTML=`<div class="card"><h3>Company details <span class="muted">(printed on invoices, used in GST returns)</span></h3>
    <div class="grid">${f("sn","Company name",S.name,2)}${f("sa","Address",S.address,2)}${f("sp","Phone",S.phone)}${f("se","Email",S.email)}
    <div><label>State</label><select id="ss">${stateOpts(S.state)}</select></div>${f("sg","GSTIN",S.gstin)}${f("sx","PAN",S.pan)}</div>
+   <h3 style="margin:16px 0 6px">Cash limits <span class="muted">(entries above these are flagged in red)</span></h3>
+   <div class="grid">${f("scp","Cash payment limit (₹) — Sec 40A(3): 10,000",S.cash_payment_limit||META.cash_limits.payment)}
+   ${f("scr","Cash receipt limit (₹) — Sec 269ST: 2,00,000 or more",S.cash_receipt_limit||META.cash_limits.receipt)}
+   <div><label>When a limit is exceeded</label><select id="scm"><option value="warn"${META.cash_limits.mode==="warn"?" selected":""}>Warn and ask to confirm</option><option value="block"${META.cash_limits.mode==="block"?" selected":""}>Block the entry</option><option value="off"${META.cash_limits.mode==="off"?" selected":""}>Do not check</option></select></div></div>
+   <p class="muted">A limit is exceeded when the amount is greater than it. Same-day cash entries with one person are added up. Cash moved between your own cash and bank accounts is not checked.</p>
    <div class="grid" style="margin-top:10px"><div style="grid-column:span 2"><label>Bank details for invoices</label><textarea id="sb">${esc(S.bank_details)}</textarea></div>
    <div style="grid-column:span 2"><label>Terms &amp; conditions</label><textarea id="st">${esc(S.terms)}</textarea></div></div>
    <div class="row"><button class="b p" onclick="saveSettings()">Save details</button></div></div>
@@ -366,7 +403,7 @@ async function admin(){
    <p class="muted">Ledgers, opening balances and accounting vouchers only (no stock items or inventory). Import masters before vouchers. Importing the same file twice is safe.</p><div id="tout"></div></div></div>
   <div class="card"><h3>Audit trail <span class="muted">(latest 300 changes)</span></h3>${table(["Time","User","Action","Details"],A.map(a=>`<tr><td>${esc(a.time)}</td><td>${esc(a.user)}</td><td>${esc(a.action)}</td><td style="white-space:normal;max-width:620px">${esc(a.detail)}</td></tr>`))}</div>`;
 }
-const saveSettings=guard(async()=>{await api("/api/settings",{name:$("#sn").value,address:$("#sa").value,phone:$("#sp").value,email:$("#se").value,state:$("#ss").value,gstin:$("#sg").value,pan:$("#sx").value,bank_details:$("#sb").value,terms:$("#st").value});toast("Company details saved");start()});
+const saveSettings=guard(async()=>{await api("/api/settings",{name:$("#sn").value,address:$("#sa").value,phone:$("#sp").value,email:$("#se").value,state:$("#ss").value,gstin:$("#sg").value,pan:$("#sx").value,cash_payment_limit:$("#scp").value,cash_receipt_limit:$("#scr").value,cash_limit_mode:$("#scm").value,bank_details:$("#sb").value,terms:$("#st").value});toast("Company details saved");start()});
 const addUser=guard(async()=>{await api("/api/users",{username:$("#nu").value,password:$("#np").value,role:$("#nr").value});toast("User added");admin()});
 const userUpd=guard(async(id,patch)=>{await api("/api/users/update",{id,...patch});toast("Updated");admin()});
 const resetPw=guard(async id=>{const p=prompt("New password (at least 8 characters):");if(p===null)return;await api("/api/users/update",{id,password:p});toast("Password set")});

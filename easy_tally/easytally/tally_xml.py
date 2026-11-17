@@ -265,7 +265,7 @@ def import_xml(b: Books, data: bytes) -> dict:
                     rep.warn(f"Ledger '{lname}' was not in the file; created under Suspense A/c.")
                 lines.append((ledger_ids[lname], "Dr" if paise > 0 else "Cr", abs(paise) / 100))
             vid = b.add_voucher(vtype, iso, lines, narration, _text(v, "REFERENCE") or (f"Tally #{number}" if number else ""),
-                                _commit=False)
+                                _commit=False, cash_check="skip")
             b.conn.execute("INSERT INTO tally_imports(fingerprint, voucher_id) VALUES (?,?)", (fp, vid))
             rep.counts["vouchers"] += 1
         b.conn.commit()
