@@ -136,7 +136,10 @@ class UISmoke(unittest.TestCase):
         self.assertEqual(self.errors(), [])
         self.assertEqual(len(opened), 1)
         self.assertTrue(opened[0].startswith("file://") and opened[0].endswith(".pdf"))
-        self.assertTrue(open(opened[0][len("file://"):], "rb").read().startswith(b"%PDF"))
+        from urllib.parse import urlparse
+        from urllib.request import url2pathname                    # handles Windows drive letters (file:///C:/...)
+        with open(url2pathname(urlparse(opened[0]).path), "rb") as fh:
+            self.assertTrue(fh.read().startswith(b"%PDF"))
 
     def test_invoice_flow(self):
         self.books.add_stock_item("Widget", gst_rate=18)
