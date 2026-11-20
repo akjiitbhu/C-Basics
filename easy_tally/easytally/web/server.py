@@ -89,8 +89,11 @@ class Handler(BaseHTTPRequestHandler):
         status, payload, cookie = self.api.handle(method, url.path, query, body, raw, self._token())
         if isinstance(payload, tuple):
             ctype, data, filename = payload
-            disp = "inline" if ctype in ("application/pdf", "image/jpeg") else "attachment"
-            return self._send(status, data, ctype, {"Content-Disposition": f'{disp}; filename="{filename}"'}, cookie)
+            inline = ctype.split(";")[0] in ("application/pdf", "image/jpeg", "text/html") and not query.get("download")
+            headers = {"Content-Disposition": f'{"inline" if inline else "attachment"}; filename="{filename}"'}
+            if ctype.startswith("text/html"):          # user-entered names are escaped, and scripts are blocked anyway
+                headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+            return self._send(status, data, ctype, headers, cookie)
         self._send(status, payload, cookie=cookie)
 
     def do_GET(self):

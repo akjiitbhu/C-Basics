@@ -1,6 +1,10 @@
 """The five working tabs: Masters, Vouchers, Invoices, Bank Statements, Reports."""
+import os
+import tempfile
 import tkinter as tk
+import webbrowser
 from datetime import date
+from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 
 from .. import reports
@@ -350,12 +354,24 @@ class InvoiceTab(BaseTab):
         if not pid:
             return _error("Choose a party.")
         try:
-            self.books.add_invoice(self.kind.get(), self.idate.get(), pid, self._lines_as_ids(),
-                                   ref=self.inv_no.get())
+            vid = self.books.add_invoice(self.kind.get(), self.idate.get(), pid, self._lines_as_ids(),
+                                         ref=self.inv_no.get())
         except ValueError as e:
             return _error(e)
         self.clear()
         self.app.refresh_all()
+        self._preview(vid)
+
+    def _preview(self, vid):
+        """Show the printable invoice straight after saving (opens in the PDF viewer, where Print is available)."""
+        try:
+            from ..invoice_pdf import invoice_pdf
+            fd, name = tempfile.mkstemp(suffix=".pdf", prefix="EasyTally_invoice_")
+            with os.fdopen(fd, "wb") as f:
+                f.write(invoice_pdf(self.books, vid))
+            webbrowser.open(Path(name).as_uri())
+        except Exception as e:                                   # the invoice is saved either way
+            _error(f"The invoice was saved, but the preview could not be opened: {e}")
 
     def delete_invoice(self):
         sel = self.recent.selected()

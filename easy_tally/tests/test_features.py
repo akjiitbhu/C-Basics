@@ -79,14 +79,14 @@ class NotesAndEditTests(unittest.TestCase):
 
     def test_debit_note_reduces_purchases_and_stock(self):
         b = mk(self)
-        item = b.add_stock_item("Widget", gst_rate=12)
+        item = b.add_stock_item("Widget", gst_rate=5)
         sup = b.add_ledger("Supplier", "Sundry Creditors", state="29")       # inter-state
         b.add_invoice("Purchase", "01-04-2026", sup, [(item, 10, "100")])
         b.add_invoice("Debit Note", "03-04-2026", sup, [(item, 2, "100")])
         bal = b.balances()
         self.assertEqual(bal[b.ledger_id("Purchase")], 80000)
-        self.assertEqual(bal[b.ledger_id("Input IGST")], 9600)
-        self.assertEqual(bal[sup], -89600)
+        self.assertEqual(bal[b.ledger_id("Input IGST")], 4000)                    # 5% of (1000 - 200)
+        self.assertEqual(bal[sup], -84000)
         self.assertEqual(reports.stock_summary(b, "2026-04-30").rows[0][4], "8")
 
     def test_edit_plain_voucher(self):

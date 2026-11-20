@@ -1,7 +1,10 @@
 """GST calculation helpers (India)."""
 from decimal import Decimal, ROUND_HALF_UP
 
-GST_RATES = [0, 5, 12, 18, 28]
+# Current slabs. The 12% and 28% slabs were withdrawn from 22 Sep 2025 (items and old invoices that still carry
+# them keep working, but new choices are limited to these).
+GST_RATES = [0, 5, 18]
+RATE_ERROR = "GST rate must be 0, 5 or 18"
 
 STATES = {
     "01": "Jammu & Kashmir", "02": "Himachal Pradesh", "03": "Punjab", "04": "Chandigarh",

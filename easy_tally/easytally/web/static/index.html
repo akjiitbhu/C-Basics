@@ -37,6 +37,9 @@ tr.muted td{color:var(--muted)}tr.warn td{background:var(--warn)}tr.bold td{font
 .picker{max-width:560px;margin:50px auto}.picker li{list-style:none}
 .co-btn{display:block;width:100%;text-align:left;margin:6px 0;padding:11px 14px}
 .muted{color:var(--muted)}.bad{color:var(--bad)}.red{color:var(--bad)!important;font-weight:700}
+#pv{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:20;display:none;padding:2vh 3vw}
+#pv .box{background:var(--card);height:96vh;max-width:1100px;margin:0 auto;border-radius:10px;display:flex;flex-direction:column;overflow:hidden}
+#pv iframe{flex:1;border:0;width:100%;background:#fff}
 .rv-grid{display:block}
 .rv-grid>div{min-width:0}
 .rv-img{position:sticky;top:0;z-index:6;max-height:38vh;overflow:auto;border:1px solid var(--line);border-radius:8px;background:#fff;margin:0 0 10px;box-shadow:0 4px 12px rgba(0,0,0,.12)}
@@ -63,6 +66,7 @@ tr.muted td{color:var(--muted)}tr.warn td{background:var(--warn)}tr.bold td{font
 <nav id="nav" style="display:none"></nav>
 <main id="main"></main>
 <div id="toast"></div>
+<div id="pv"></div>
 <script>
 "use strict";
 const $=(s,e=document)=>e.querySelector(s);
@@ -128,7 +132,8 @@ async function picker(){
    ${can("admin")?`<hr style="border:0;border-top:1px solid var(--line);margin:14px 0"><h3>New company</h3>
    <div class="grid"><div><label>Company name</label><input id="cn"></div>
    <div><label>State</label><select id="cs">${stateOpts("")}</select></div>
-   <div><label>GSTIN (optional)</label><input id="cg"></div></div>
+   <div><label>GSTIN (needed for GST invoices)</label><input id="cg" placeholder="e.g. 27ABCDE1234F1Z5"></div></div>
+   <p class="muted" style="margin:6px 0 0">The first two digits of a GSTIN are the state code, so the state is filled in from it. Every new company starts with the GST ledgers ready: <b>Output / Input CGST, SGST and IGST</b> (under Duties &amp; Taxes), plus Sales and Purchase.</p>
    <div class="row"><button class="b p" onclick="newCo()">Create & open</button></div>
    <hr style="border:0;border-top:1px solid var(--line);margin:14px 0"><h3>Restore from backup</h3>
    <div class="row"><input type="file" id="rf" accept=".zip,.db" style="width:auto"><button class="b" onclick="restoreFile('rf')">Restore</button></div>`:""}</div>`;
@@ -136,11 +141,28 @@ async function picker(){
 // Anything half-finished belongs to one company: never carry it into another one.
 function resetState(){VL=[];IL=[];VEDIT=null;IEDIT=null;BANK="";RV=null;RQ.ledger="";RL=[]}
 const openCo=guard(async s=>{await api("/api/company/open",{slug:s});resetState();await start()});
-const newCo=guard(async()=>{await api("/api/company/create",{name:$("#cn").value,state:$("#cs").value,gstin:$("#cg").value});resetState();await start()});
+const newCo=guard(async()=>{await api("/api/company/create",{name:$("#cn").value,state:$("#cs").value,gstin:$("#cg").value});resetState();await start();toast("Company created. GST ledgers (Output / Input CGST, SGST, IGST) are ready under Duties & Taxes.")});
 const switchCompany=guard(async()=>{await api("/api/company/close",{});resetState();await start()});
 const quit=async()=>{if(!confirm("Quit EasyTally? Your data is saved."))return;try{await api("/api/shutdown",{})}catch{}document.body.innerHTML='<p style="padding:40px">EasyTally has stopped. You can close this tab. Start it again from the Start menu.</p>'};
 function go(t){TAB=t;start()}
 const show=guard(async()=>{await({masters,vouchers,invoices,bank,reports,admin}[TAB])()});
+
+const KIND_LABEL={"Sales":"Tax Invoice (GST Sale)","Purchase":"Purchase","Credit Note":"Credit Note","Debit Note":"Debit Note"};
+// GST % choices: the current slabs, plus the item's own older rate if it still carries one (shown as "(old)").
+const rateList=cur=>[...new Set([...META.gst_rates,Number(cur)])].filter(x=>!isNaN(x)).sort((a,b)=>a-b);
+const rateOpts=(cur)=>rateList(cur).map(r=>`<option value="${r}"${r===Number(cur)?" selected":""}>${r}%${META.gst_rates.includes(r)?"":" (old)"}</option>`).join("");
+
+/* ---------- invoice print preview ---------- */
+function invPreview(id){
+  const src=`/api/invoice.pdf?id=${id}`,view=`/api/invoice.html?id=${id}`;
+  $("#pv").innerHTML=`<div class="box"><div class="row" style="margin:0;padding:10px 14px;border-bottom:1px solid var(--line)"><h3 style="margin:0">Print preview</h3><span class="sp" style="flex:1"></span>
+   <button class="b p" onclick="pvPrint()">Print</button><a class="b" href="${src}&download=1">Download PDF</a><a class="b" href="${src}" target="_blank">Open PDF</a><button class="b" onclick="pvClose()">Close</button></div>
+   <iframe id="pvf" src="${view}" title="Invoice preview"></iframe></div>`;
+  $("#pv").style.display="block";document.addEventListener("keydown",pvEsc);
+}
+function pvPrint(){const f=$("#pvf");try{f.contentWindow.focus();f.contentWindow.print()}catch(e){window.open(f.src,"_blank")}}   // prints only the invoice
+function pvClose(){$("#pv").style.display="none";$("#pv").innerHTML="";document.removeEventListener("keydown",pvEsc)}
+const pvEsc=e=>{if(e.key==="Escape")pvClose()};
 
 /* ---------- masters ---------- */
 async function masters(){
@@ -160,11 +182,12 @@ async function masters(){
    <div><label>HSN / SAC</label><input id="ih"></div><div><label>GST %</label><select id="ir">${sopts(META.gst_rates.map(String),"18")}</select></div>
    <div><label>Opening qty</label><input id="iq" value="0"></div><div><label>Opening value</label><input id="iv" value="0"></div></div>
    <div class="row"><button class="b p" onclick="addItem()">Add item</button></div><br>`:""}
-   ${table(["Item","Unit","HSN","GST %","Open qty","Open value",""],I.map(i=>`<tr><td>${esc(i.name)}</td><td>${esc(i.unit)}</td><td>${esc(i.hsn)}</td><td>${i.gst_rate}</td><td class="n">${i.opening_qty}</td><td class="n">${i.opening_value}</td><td>${delBtn("delItem",i.id)}</td></tr>`),[4,5])}</div></div>`;
+   ${table(["Item","Unit","HSN","GST %","Open qty","Open value",""],I.map(i=>`<tr><td>${esc(i.name)}</td><td>${esc(i.unit)}</td><td>${esc(i.hsn)}</td><td>${W?`<select style="width:auto" onchange="setItemRate(${i.id},this.value)">${rateOpts(i.gst_rate)}</select>`:i.gst_rate+"%"}</td><td class="n">${i.opening_qty}</td><td class="n">${i.opening_value}</td><td>${delBtn("delItem",i.id)}</td></tr>`),[4,5])}</div></div>`;
 }
 const addLedger=guard(async()=>{await api("/api/ledgers",{name:$("#ln").value,group:$("#lg").value,opening:$("#lo").value,side:$("#ls").value,gstin:$("#lt").value,state:$("#lst").value});toast("Ledger added");masters()});
 const delLedger=guard(async id=>{await api("/api/ledgers/delete",{id});masters()});
 const addItem=guard(async()=>{await api("/api/items",{name:$("#in").value,unit:$("#iu").value,hsn:$("#ih").value,gst_rate:$("#ir").value,opening_qty:$("#iq").value,opening_value:$("#iv").value});toast("Item added");masters()});
+const setItemRate=guard(async(id,r)=>{await api("/api/items/update",{id,gst_rate:r});toast(`GST rate set to ${r}% for new invoices (saved invoices keep theirs)`);masters()});
 const delItem=guard(async id=>{await api("/api/items/delete",{id});masters()});
 
 /* ---------- cash limits ---------- */
@@ -251,40 +274,49 @@ async function invoices(){
   const [R,L,I]=await Promise.all([api("/api/invoices"),api("/api/ledgers"),api("/api/items")]);
   ITEMS=I;PARTIES=L.filter(l=>l.group==="Sundry Debtors"||l.group==="Sundry Creditors");
   const W=can("write");
-  $("#main").innerHTML=`${W?`<div class="card"><h3>${IEDIT?"Edit document":"New GST invoice / credit note / debit note"}</h3>
-   <div class="grid"><div><label>Type</label><select id="ik" onchange="iPrev()" ${IEDIT?"disabled":""}>${sopts(META.invoice_kinds,"Sales")}</select></div>
+  $("#main").innerHTML=`${W?`<div class="card"><h3>${IEDIT?"Edit document":"New Tax Invoice (GST sale) / note"}</h3>
+   <div class="grid"><div><label>Type</label><select id="ik" onchange="iPrev()" ${IEDIT?"disabled":""}>${opts(META.invoice_kinds.map(k=>({k,t:KIND_LABEL[k]||k})),"k","t","Sales")}</select></div>
    <div><label>Date</label><input type="date" id="id" value="${today()}"></div>
    <div style="grid-column:span 2"><label>Party (debtor / creditor)</label><select id="ip" onchange="iPrev()">${opts(PARTIES,"id","name","","Select party…")}</select></div>
    <div><label>Document no.</label><input id="ir"></div></div>
-   <div class="grid" style="margin-top:10px"><div style="grid-column:span 2"><label>Item</label><select id="ii">${opts(I,"id","name","","Select item…")}</select></div>
-   <div><label>Qty</label><input id="iqq" value="1"></div><div><label>Rate</label><input id="irt" inputmode="decimal"></div><div><button class="b" onclick="iAdd()">Add item</button></div></div>
+   <div class="grid" style="margin-top:10px"><div style="grid-column:span 2"><label>Item</label><select id="ii" onchange="iItem()">${opts(I,"id","name","","Select item…")}</select></div>
+   <div><label>Qty</label><input id="iqq" value="1"></div><div><label>Rate</label><input id="irt" inputmode="decimal"></div>
+   <div><label>GST %</label><select id="ig">${rateOpts(18)}</select></div><div><button class="b" onclick="iAdd()">Add item</button></div></div>
    <div id="ilines"></div><div class="row"><button class="b p" onclick="iSave()">${IEDIT?"Update":"Save"}</button><button class="b" onclick="IEDIT=null;IL=[];invoices()">${IEDIT?"Cancel edit":"Clear"}</button><span id="itot" class="tot"></span></div></div>`:""}
-  <div class="card"><h3>Recent documents</h3>${table(["Date","Type","No.","Ref","Party","Taxable","CGST","SGST","IGST","Total",""],R.map(r=>`<tr><td>${r.date}</td><td>${r.kind}</td><td>${r.number}</td><td>${esc(r.ref)}</td><td>${esc(r.party)}</td><td class="n">${r.taxable}</td><td class="n">${r.cgst}</td><td class="n">${r.sgst}</td><td class="n">${r.igst}</td><td class="n">${r.total}</td><td><a class="b" href="/api/invoice.pdf?id=${r.id}" target="_blank">PDF</a> ${W?`<button class="b" onclick="iEdit(${r.id})">Edit</button>`:""} ${delBtn("iDel",r.id)}</td></tr>`),[5,6,7,8,9])}</div>`;
+  <div class="card"><h3>Recent documents</h3>${table(["Date","Type","No.","Ref","Party","Taxable","CGST","SGST","IGST","Total",""],R.map(r=>`<tr><td>${r.date}</td><td>${KIND_LABEL[r.kind]||r.kind}</td><td>${r.number}</td><td>${esc(r.ref)}</td><td>${esc(r.party)}</td><td class="n">${r.taxable}</td><td class="n">${r.cgst}</td><td class="n">${r.sgst}</td><td class="n">${r.igst}</td><td class="n">${r.total}</td><td><button class="b" onclick="invPreview(${r.id})">Preview / Print</button> ${W?`<button class="b" onclick="iEdit(${r.id})">Edit</button>`:""} ${delBtn("iDel",r.id)}</td></tr>`),[5,6,7,8,9])}</div>`;
   if(W)iPrev();
+}
+// Choosing an item fills the GST % with that item's rate; change it here for just this line if needed.
+function iItem(){
+  const it=ITEMS.find(x=>String(x.id)===$("#ii").value),g=$("#ig");if(!g)return;
+  g.innerHTML=rateOpts(it?it.gst_rate:18);
 }
 function iAdd(){
   if(!$("#ii").value)return toast("Choose an item",true);
   if(!(parseFloat($("#iqq").value)>0))return toast("Enter a valid quantity",true);
-  IL.push({item_id:$("#ii").value,qty:$("#iqq").value,rate:$("#irt").value||"0"});$("#ii").value="";$("#iqq").value="1";$("#irt").value="";iPrev();
+  IL.push({item_id:$("#ii").value,qty:$("#iqq").value,rate:$("#irt").value||"0",gst_rate:$("#ig").value});
+  $("#ii").value="";$("#iqq").value="1";$("#irt").value="";iItem();iPrev();
 }
 const iPrev=guard(async()=>{
   const el=$("#ilines");if(!el)return;
   if(!IL.length||!$("#ip").value){el.innerHTML="";$("#itot").textContent=IL.length?"Select a party to see GST":"";return}
   const p=await api("/api/invoices/preview",{kind:$("#ik").value,party_id:$("#ip").value,lines:IL});
-  el.innerHTML=table(["Item","Qty","Rate","GST %","Taxable","CGST","SGST","IGST",""],p.lines.map((l,i)=>`<tr><td>${esc(ITEMS.find(x=>String(x.id)===String(l.item_id)).name)}</td><td class="n">${l.qty}</td><td class="n">${l.rate}</td><td>${l.gst_rate}</td><td class="n">${l.taxable}</td><td class="n">${l.cgst}</td><td class="n">${l.sgst}</td><td class="n">${l.igst}</td><td><button class="b d" onclick="IL.splice(${i},1);iPrev()">Remove</button></td></tr>`),[1,2,4,5,6,7]);
+  el.innerHTML=table(["Item","Qty","Rate","GST %","Taxable","CGST","SGST","IGST",""],p.lines.map((l,i)=>`<tr><td>${esc(ITEMS.find(x=>String(x.id)===String(l.item_id)).name)}</td><td class="n">${l.qty}</td><td class="n">${l.rate}</td><td><select style="width:auto" onchange="IL[${i}].gst_rate=this.value;iPrev()">${rateOpts(l.gst_rate)}</select></td><td class="n">${l.taxable}</td><td class="n">${l.cgst}</td><td class="n">${l.sgst}</td><td class="n">${l.igst}</td><td><button class="b d" onclick="IL.splice(${i},1);iPrev()">Remove</button></td></tr>`),[1,2,4,5,6,7]);
   $("#itot").textContent=`Taxable ${p.taxable}  CGST ${p.cgst}  SGST ${p.sgst}  IGST ${p.igst}  TOTAL ${p.total}  (${p.intra_state?"intra-state":"inter-state"})`;
 });
 const iEdit=guard(async id=>{
   const v=await api("/api/voucher?id="+id);if(!v.invoice)throw new Error("Not an invoice");
-  IEDIT=id;IL=v.invoice.lines.map(l=>({item_id:String(l.item_id),qty:l.qty,rate:l.rate}));
+  IEDIT=id;IL=v.invoice.lines.map(l=>({item_id:String(l.item_id),qty:l.qty,rate:l.rate,gst_rate:l.gst_rate}));
   TAB="invoices";await start();
   $("#ik").value=v.invoice.kind;$("#id").value=v.date;$("#ip").value=String(v.invoice.party_id);$("#ir").value=v.ref;await iPrev();window.scrollTo(0,0);
 });
 const iSave=guard(async()=>{
   const body={date:$("#id").value,party_id:$("#ip").value,ref:$("#ir").value,lines:IL};
-  if(IEDIT){await api("/api/invoices/update",{id:IEDIT,...body});toast("Document updated")}
-  else{await api("/api/invoices",{kind:$("#ik").value,...body});toast("Document saved")}
-  IEDIT=null;IL=[];invoices();
+  let id;
+  if(IEDIT){await api("/api/invoices/update",{id:IEDIT,...body});id=IEDIT;toast("Document updated")}
+  else{id=(await api("/api/invoices",{kind:$("#ik").value,...body})).id;toast("Document saved")}
+  IEDIT=null;IL=[];await invoices();
+  invPreview(id);                                           // show / print what was just entered
 });
 const iDel=guard(async id=>{if(confirm("Delete this document?")){await api("/api/vouchers/delete",{ids:[id]});if(IEDIT===id){IEDIT=null;IL=[]}invoices()}});
 

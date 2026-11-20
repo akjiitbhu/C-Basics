@@ -7,10 +7,30 @@ from datetime import date, datetime
 from pathlib import Path
 
 from . import db
-from .gst import compute_gst, is_intra_state
+from .gst import GST_RATES, RATE_ERROR, compute_gst, is_intra_state
 from .money import fmt, to_paise
 
 GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$")
+
+def check_gstin_state(gstin, state):
+    """Validate a GSTIN and reconcile it with a state code. Returns (gstin, state).
+
+    The first two digits of a GSTIN are the state code, so a blank state is filled in from it, and a state
+    that disagrees with it is refused.
+    """
+    gstin = (gstin or "").strip().upper()
+    state = (state or "").strip()
+    if not gstin:
+        return "", state
+    if not GSTIN_RE.match(gstin):
+        raise ValueError("GSTIN looks wrong: it should be 15 characters, e.g. 27ABCDE1234F1Z5")
+    if not state:
+        return gstin, gstin[:2]
+    if state != gstin[:2]:
+        raise ValueError(f"The first two digits of the GSTIN ({gstin[:2]}) are the state code and do not match "
+                         f"the selected state ({state})")
+    return gstin, state
+
 
 DATE_FORMATS = ["%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y", "%d-%m-%y", "%d/%m/%y", "%d.%m.%y",
                 "%Y-%m-%d", "%d %b %Y", "%d-%b-%Y", "%d-%b-%y", "%d %b %y",
@@ -76,6 +96,7 @@ class Books:
         name = name.strip()
         if not name:
             raise ValueError("Company name is required")
+        gstin, state = check_gstin_state(gstin, state)
         path = db.company_path(db.slugify(name))
         if path.exists():
             raise ValueError(f"A company named '{name}' already exists")
@@ -126,11 +147,12 @@ class Books:
                 clean[k] = str(values[k]).strip()
         if "name" in clean and not clean["name"]:
             raise ValueError("Company name cannot be empty")
-        gstin = clean.get("gstin", "").upper()
-        if gstin and not GSTIN_RE.match(gstin):
-            raise ValueError("GSTIN looks wrong: it should be 15 characters, e.g. 27ABCDE1234F1Z5")
-        if "gstin" in clean:
-            clean["gstin"] = gstin
+        if "gstin" in clean or "state" in clean:
+            gstin_new, state_new = check_gstin_state(clean.get("gstin", self.setting("gstin")),
+                                                     clean.get("state", self.setting("state")))
+            clean["gstin"] = gstin_new
+            if gstin_new and not clean.get("state"):
+                clean["state"] = state_new
         for k in ("cash_payment_limit", "cash_receipt_limit"):
             if clean.get(k):
                 if to_paise(clean[k]) < 0:
@@ -258,11 +280,7 @@ class Books:
         if amount < 0:
             raise ValueError("Opening balance must not be negative; choose Dr or Cr")
         signed = amount if side == "Dr" else -amount
-        gstin = gstin.strip().upper()
-        if gstin and not GSTIN_RE.match(gstin):
-            raise ValueError("GSTIN looks wrong: it should be 15 characters, e.g. 27ABCDE1234F1Z5")
-        if gstin and not state:
-            state = gstin[:2]            # first two digits of a GSTIN are the state code
+        gstin, state = check_gstin_state(gstin, state)
         try:
             cur = self.conn.execute(
                 "INSERT INTO ledgers(name, group_id, opening, gstin, state) VALUES (?,?,?,?,?)",
@@ -303,16 +321,45 @@ class Books:
         name = name.strip()
         if not name:
             raise ValueError("Item name is required")
+        rate = self._check_rate(gst_rate)
         try:
             cur = self.conn.execute(
                 "INSERT INTO stock_items(name, unit, hsn, gst_rate, opening_qty, opening_value) "
                 "VALUES (?,?,?,?,?,?)",
-                (name, unit.strip() or "Nos", hsn.strip(), int(gst_rate), float(opening_qty),
+                (name, unit.strip() or "Nos", hsn.strip(), rate, float(opening_qty),
                  to_paise(opening_value)))
         except sqlite3.IntegrityError:
             raise ValueError(f"Item '{name}' already exists")
         self.conn.commit()
         return cur.lastrowid
+
+    @staticmethod
+    def _check_rate(value) -> int:
+        try:
+            rate = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(RATE_ERROR)
+        if rate not in GST_RATES:
+            raise ValueError(RATE_ERROR + " (the 12% and 28% slabs were withdrawn from 22 Sep 2025)")
+        return rate
+
+    def update_stock_item(self, item_id, name=None, unit=None, hsn=None, gst_rate=None):
+        """Change an item's details. A new GST rate applies to future invoices only; saved invoices keep theirs."""
+        row = self.conn.execute("SELECT * FROM stock_items WHERE id=?", (item_id,)).fetchone()
+        if not row:
+            raise ValueError("Item not found")
+        new = {"name": (name if name is not None else row["name"]).strip(),
+               "unit": ((unit if unit is not None else row["unit"]).strip() or "Nos"),
+               "hsn": (hsn if hsn is not None else row["hsn"]).strip(),
+               "gst_rate": row["gst_rate"] if gst_rate in (None, "") else self._check_rate(gst_rate)}
+        if not new["name"]:
+            raise ValueError("Item name is required")
+        try:
+            self.conn.execute("UPDATE stock_items SET name=?, unit=?, hsn=?, gst_rate=? WHERE id=?",
+                              (new["name"], new["unit"], new["hsn"], new["gst_rate"], item_id))
+        except sqlite3.IntegrityError:
+            raise ValueError(f"Item '{new['name']}' already exists")
+        self.conn.commit()
 
     def stock_items(self):
         return self.conn.execute("SELECT * FROM stock_items ORDER BY name").fetchall()
@@ -407,7 +454,8 @@ class Books:
         inv = self.conn.execute("SELECT * FROM invoices WHERE voucher_id=?", (voucher_id,)).fetchone()
         if inv:
             out["invoice"] = {"kind": inv["kind"], "party_id": inv["party_id"],
-                              "lines": [{"item_id": l["item_id"], "qty": l["qty"], "rate": l["rate"] / 100}
+                              "lines": [{"item_id": l["item_id"], "qty": l["qty"], "rate": l["rate"] / 100,
+                                        "gst_rate": l["gst_rate"]}
                                         for l in self.conn.execute(
                                             "SELECT * FROM invoice_lines WHERE voucher_id=? ORDER BY id",
                                             (voucher_id,))]}
@@ -468,10 +516,15 @@ class Books:
             raise ValueError("Select a party")
         intra = is_intra_state(self.setting("state"), party["state"])
         out_lines, totals = [], dict(taxable=0, cgst=0, sgst=0, igst=0)
-        for item_id, qty, rate in lines:
+        for line in lines:
+            item_id, qty, rate = line[0], line[1], line[2]
+            chosen = line[3] if len(line) > 3 else None
             item = self.conn.execute("SELECT * FROM stock_items WHERE id=?", (item_id,)).fetchone()
             if not item:
                 raise ValueError("Unknown stock item")
+            gst_rate = item["gst_rate"] if chosen in (None, "") else int(chosen)
+            if gst_rate not in GST_RATES and gst_rate != item["gst_rate"]:
+                raise ValueError(RATE_ERROR)
             qty = float(qty)
             if qty <= 0:
                 raise ValueError("Quantity must be greater than zero")
@@ -479,8 +532,8 @@ class Books:
             if rate_p < 0:
                 raise ValueError("Rate cannot be negative")
             taxable = int(round(qty * rate_p))
-            cg, sg, ig = compute_gst(taxable, item["gst_rate"], intra)
-            out_lines.append(dict(item_id=item_id, qty=qty, rate=rate_p, gst_rate=item["gst_rate"],
+            cg, sg, ig = compute_gst(taxable, gst_rate, intra)
+            out_lines.append(dict(item_id=item_id, qty=qty, rate=rate_p, gst_rate=gst_rate,
                                   taxable=taxable, cgst=cg, sgst=sg, igst=ig))
             totals["taxable"] += taxable; totals["cgst"] += cg
             totals["sgst"] += sg; totals["igst"] += ig

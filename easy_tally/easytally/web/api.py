@@ -15,7 +15,7 @@ from .. import auth, backup, db, gst_returns, reports, tally_xml
 from ..accounting import INVOICE_KINDS, Books, CashLimitError, display_date, parse_date
 from ..bank_import import StatementError, check_consistency, parse_statement_ex
 from ..gst import GST_RATES, STATES
-from ..invoice_pdf import invoice_pdf
+from ..invoice_pdf import invoice_html, invoice_pdf
 from ..accounting import VOUCHER_TYPES
 from ..money import fmt, fmt_dr_cr
 
@@ -256,6 +256,11 @@ class Api:
                                      body.get("opening_qty") or 0, body.get("opening_value") or "0")
         return {"id": i}
 
+    def item_update(self, q, body, raw):
+        self._b().update_stock_item(_int(body.get("id")), body.get("name"), body.get("unit"), body.get("hsn"),
+                                    body.get("gst_rate"))
+        return {"ok": True}
+
     def item_delete(self, q, body, raw):
         self._b().delete_stock_item(_int(body.get("id")))
         return {"ok": True}
@@ -306,7 +311,7 @@ class Api:
 
     # ---- invoices ----------------------------------------------------------
     def _inv_lines(self, body):
-        return [(_int(l.get("item_id"), "item"), l.get("qty"), l.get("rate") or "0")
+        return [(_int(l.get("item_id"), "item"), l.get("qty"), l.get("rate") or "0", l.get("gst_rate"))
                 for l in body.get("lines", [])]
 
     def invoice_preview(self, q, body, raw):
@@ -336,6 +341,10 @@ class Api:
         return [{"id": r["id"], "date": display_date(r["date"]), "kind": r["kind"], "number": r["number"],
                  "ref": r["ref"], "party": r["pname"], "taxable": fmt(r["taxable"]), "cgst": fmt(r["cgst"]),
                  "sgst": fmt(r["sgst"]), "igst": fmt(r["igst"]), "total": fmt(r["total"])} for r in rows]
+
+    def invoice_html(self, q, body, raw):
+        """The on-screen print preview: the invoice as a printable HTML page (every browser can show and print it)."""
+        return ("text/html; charset=utf-8", invoice_html(self._b(), _int(q.get("id"))).encode("utf-8"), "invoice.html")
 
     def invoice_pdf(self, q, body, raw):
         vid = _int(q.get("id"))
@@ -588,13 +597,14 @@ ROUTES = {
     ("GET", "/api/ledgers"): (Api.ledgers, "read"), ("POST", "/api/ledgers"): (Api.ledger_add, "write"),
     ("POST", "/api/ledgers/delete"): (Api.ledger_delete, "delete"),
     ("GET", "/api/items"): (Api.items, "read"), ("POST", "/api/items"): (Api.item_add, "write"),
-    ("POST", "/api/items/delete"): (Api.item_delete, "delete"),
+    ("POST", "/api/items/update"): (Api.item_update, "write"), ("POST", "/api/items/delete"): (Api.item_delete, "delete"),
     ("GET", "/api/vouchers"): (Api.vouchers, "read"), ("GET", "/api/voucher"): (Api.voucher_get, "read"),
     ("POST", "/api/vouchers"): (Api.voucher_add, "write"), ("POST", "/api/vouchers/update"): (Api.voucher_update, "write"),
     ("POST", "/api/vouchers/delete"): (Api.voucher_delete, "delete"),
     ("GET", "/api/invoices"): (Api.invoices, "read"), ("POST", "/api/invoices"): (Api.invoice_add, "write"),
     ("POST", "/api/invoices/update"): (Api.invoice_update, "write"),
     ("POST", "/api/invoices/preview"): (Api.invoice_preview, "read"), ("GET", "/api/invoice.pdf"): (Api.invoice_pdf, "read"),
+    ("GET", "/api/invoice.html"): (Api.invoice_html, "read"),
     ("GET", "/api/bank/accounts"): (Api.bank_accounts, "read"), ("GET", "/api/bank/txns"): (Api.bank_txns, "read"),
     ("POST", "/api/bank/import"): (Api.bank_import, "write", Api._import_prep),
     ("POST", "/api/bank/set_ledger"): (Api.bank_set_ledger, "write"),
@@ -617,7 +627,7 @@ ROUTES = {
 
 # Changes that are written to the company's audit trail (who did what).
 AUDITED = {
-    "/api/ledgers": "Ledger added", "/api/ledgers/delete": "Ledger deleted", "/api/items": "Stock item added",
+    "/api/ledgers": "Ledger added", "/api/ledgers/delete": "Ledger deleted", "/api/items": "Stock item added", "/api/items/update": "Stock item changed",
     "/api/items/delete": "Stock item deleted", "/api/vouchers": "Voucher added", "/api/vouchers/update": "Voucher edited",
     "/api/vouchers/delete": "Voucher deleted", "/api/invoices": "Invoice added", "/api/invoices/update": "Invoice edited",
     "/api/bank/import": "Bank statement imported", "/api/bank/post": "Bank rows posted",

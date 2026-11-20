@@ -51,7 +51,7 @@ class BooksTests(unittest.TestCase):
         self.assertEqual(sum(bal.values()), 0)
 
     def test_reports_balance(self):
-        item = self.b.add_stock_item("Widget", gst_rate=12, opening_qty=5, opening_value="500")
+        item = self.b.add_stock_item("Widget", gst_rate=5, opening_qty=5, opening_value="500")
         supplier = self.b.add_ledger("Supplier", "Sundry Creditors", state="27")
         cust = self.b.add_ledger("Cust", "Sundry Debtors", state="27")
         bank = self.b.add_ledger("HDFC", "Bank Accounts", opening="10000", side="Dr")

@@ -123,6 +123,21 @@ class UISmoke(unittest.TestCase):
         self.vouchers.ledger.set("Nope"); self.vouchers.amount.set("5"); self.vouchers.add_line()
         self.assertEqual(len(self.errors()), 1)
 
+    def test_desktop_opens_the_printable_invoice_after_saving(self):
+        self.books.add_stock_item("Widget", gst_rate=18)
+        self.books.add_ledger("Cust", "Sundry Debtors", state="27")
+        opened = []
+        T.webbrowser.open = lambda url, *a, **k: opened.append(url)
+        i = self.invoices
+        i.refresh()
+        i.kind.set("Sales"); i.idate.set("02-04-2026"); i.party.set("Cust")
+        i.item.set("Widget"); i.qty.set("1"); i.rate.set("100"); i.add_line()
+        i.save()
+        self.assertEqual(self.errors(), [])
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].startswith("file://") and opened[0].endswith(".pdf"))
+        self.assertTrue(open(opened[0][len("file://"):], "rb").read().startswith(b"%PDF"))
+
     def test_invoice_flow(self):
         self.books.add_stock_item("Widget", gst_rate=18)
         self.books.add_ledger("Cust", "Sundry Debtors", state="29")
